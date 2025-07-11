@@ -1,12 +1,13 @@
 name: Run Python Script
 
-on: [push]
+on:
+  push:
+    branches:
+      - main
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    env:
-      BASE_URL: "https://example.com"
     steps:
       - name: 코드 체크아웃
         uses: actions/checkout@v3
@@ -21,7 +22,5 @@ jobs:
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
         run: |
-          echo "API_KEY는 숨김 처리됩니다"
-          echo "SUPABASE_KEY: SUPABASE_KEY"
-          echo "SUPABASE_URL: SUPABASE_URL"
+          set -e
           python rss-scrapper.py
