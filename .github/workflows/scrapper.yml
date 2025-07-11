@@ -2,8 +2,11 @@ name: Run Python Script
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
+  schedule:
+    - cron: '0 0 * * *'   # 오전 8시 (KST)
+    - cron: '0 3 * * *'   # 오후 12시 (KST)
+    - cron: '0 9 * * *'   # 오후 6시 (KST)
 
 jobs:
   build:
