@@ -1,0 +1,27 @@
+name: Run Python Script
+
+on: [push]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      BASE_URL: "https://example.com"
+    steps:
+      - name: 코드 체크아웃
+        uses: actions/checkout@v3
+
+      - name: 파이썬 설정
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Secret 및 환경변수 사용
+        env:
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+        run: |
+          echo "API_KEY는 숨김 처리됩니다"
+          echo "SUPABASE_KEY: SUPABASE_KEY"
+          echo "SUPABASE_URL: SUPABASE_URL"
+          python rss-scrapper.py

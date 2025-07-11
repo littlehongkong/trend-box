@@ -1,11 +1,12 @@
 import feedparser
 from datetime import datetime
 from supabase import create_client
-import hashlib
+import os
+
 
 # ✅ Supabase 설정
-SUPABASE_URL = "https://ufdpxtnfhxkdvwfrdunw.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVmZHB4dG5maHhrZHZ3ZnJkdW53Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTIxOTYxMDcsImV4cCI6MjA2Nzc3MjEwN30.UrZ2IF2CXGJ6qX_0D4JyCqehXiMhEFQeoPORwdwvcQQ"
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ✅ 키워드 목록
