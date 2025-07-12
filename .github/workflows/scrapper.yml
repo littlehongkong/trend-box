@@ -30,3 +30,4 @@ jobs:
         run: |
           set -e
           python rss-scrapper.py
+          python newsletter_sender.py
