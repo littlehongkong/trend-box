@@ -4,7 +4,8 @@ import logging
 from datetime import datetime
 from supabase import create_client
 from dotenv import load_dotenv
-from typing import List, Dict, Any
+import re
+
 
 # Configure logging
 logging.basicConfig(
