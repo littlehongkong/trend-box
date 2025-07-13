@@ -6,6 +6,10 @@ from supabase import create_client
 from dotenv import load_dotenv
 from typing import List, Dict, Any, Optional
 import resend
+import re
+import time
+
+# Resend 예외 처리를 위한 임포트 제거
 
 # Configure logging
 logging.basicConfig(
@@ -24,7 +28,8 @@ load_dotenv()
 # Initialize Resend
 resend.api_key = os.getenv("RESEND_API_KEY")
 if not resend.api_key:
-    logger.warning("RESEND_API_KEY not found in environment variables")
+    logger.error("RESEND_API_KEY not found in environment variables")
+    raise ValueError("RESEND_API_KEY environment variable is required")
 
 # Supabase 설정
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -125,7 +130,6 @@ def summarize_with_ai(texts: List[str], category: str, max_retries: int = 2) -> 
             }
             
             # API 요청 시간 측정
-            import time
             start_time = time.time()
             
             response = requests.post(
@@ -251,7 +255,7 @@ def format_newsletter() -> Optional[str]:
         points_added = 0
         for point in [p.strip() for p in overall_summary.split('\n') if p.strip()]:
             # 특수문자 반복 제거 (예: "..."를 "."으로 정규화)
-            import re
+
             point = re.sub(r'[.]+', '.', point)  # 여러 개의 점을 하나로
             point = re.sub(r'[!?]+', lambda x: x.group(0)[0], point)  # 연속된 특수문자 하나로
             
@@ -410,8 +414,11 @@ def send_newsletter():
             logger.error(f"Unexpected response from Resend API: {response}")
             return False
             
-    except resend.ResendError as e:
-        logger.error(f"Resend API error: {str(e)}")
+    except Exception as e:
+        if hasattr(e, 'status_code'):
+            logger.error(f"Resend API error (HTTP {e.status_code}): {str(e)}")
+        else:
+            logger.error(f"Resend API error: {str(e)}")
         return False
     except Exception as e:
         logger.error(f"Unexpected error while sending email: {str(e)}", exc_info=True)
