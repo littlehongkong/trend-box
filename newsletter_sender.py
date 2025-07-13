@@ -344,12 +344,23 @@ def format_newsletter() -> Optional[str]:
             # 요약 포인트 추가 (최대 3개)
             points_added = 0
             for point in [p.strip() for p in category_summary.split('\n') if p.strip()]:
+                # 테이블 형식이나 불필요한 문자 제거
+                point = re.sub(r'\|.*$', '', point)  # 파이프 문자 이후 모두 제거
+                point = re.sub(r'\s+', ' ', point)   # 연속된 공백을 하나로
+                point = re.sub(r'^[0-9\s\-\*•]+', '', point)  # 번호나 글머리 기호 제거
+                point = point.strip()
+                
                 # 특수문자 반복 제거
                 point = re.sub(r'[.]+', '.', point)
                 point = re.sub(r'[!?]+', lambda x: x.group(0)[0], point)
                 
-                if len(point) > 5 and points_added < 3:  # 3개로 제한
-                    html_content += f'<li style="margin-bottom: 8px; line-height: 1.5;">• {point}</li>'
+                # 유효한 문장인지 확인 (최소 길이 및 의미 있는 텍스트인지)
+                if (len(point) > 10 and 
+                    not any(c.isdigit() for c in point) and  # 숫자만 있는 라인 제외
+                    not re.match(r'^[\s\W]+$', point) and  # 특수문자만 있는 라인 제외
+                    points_added < 3):  # 3개로 제한
+                    
+                    html_content += f'<li style="margin-bottom: 8px; line-height: 1.5;">{point}</li>'
                     points_added += 1
             
             html_content += """
@@ -398,12 +409,16 @@ def format_newsletter() -> Optional[str]:
             </ul>
         """
         
-        # 관련 기사 더보기 (4개 이상인 경우에만 표시)
+        # 중복/유사 뉴스 섹션 (4개 이상인 경우에만 표시)
         if len(top_items) > 3:
-            html_content += f"""
-            <div id="related-articles-{keyword}" style="display: none; margin-top: 10px; border-top: 1px solid #e5e7eb; padding-top: 10px;">
+            related_count = len(top_items) - 3
+            html_content += """
+            <div style="margin-top: 20px; padding-top: 15px; border-top: 1px solid #e5e7eb;">
+                <h3 style="color: #4b5563; font-size: 0.95em; margin: 0 0 12px 0; padding-bottom: 8px; border-bottom: 1px dashed #d1d5db;">
+                    🔄 중복/유사 뉴스 ({0}건)
+                </h3>
                 <ul style="list-style: none; padding: 0; margin: 0;">
-            """.format(keyword=keyword.replace(' ', '-'))
+            """.format(related_count)
             
             for item in top_items[3:]:
                 if item.get('source') == 'Vietnam.vn':
@@ -415,44 +430,27 @@ def format_newsletter() -> Optional[str]:
                 pub_date = datetime.fromisoformat(item.get('pub_date', datetime.now().isoformat()))
                 formatted_date = pub_date.strftime('%Y년 %m월 %d일 %H:%M')
                 
+                # 유사도 점수가 있으면 표시 (없으면 생략)
+                similarity = item.get('similarity')
+                similarity_badge = f'<span style="display: inline-block; background-color: #e5e7eb; color: #4b5563; font-size: 0.75em; padding: 1px 6px; border-radius: 4px; margin-left: 6px;">유사도 {similarity}%</span>' if similarity else ''
+                
                 html_content += f"""
-                <li style="margin-bottom: 12px; padding: 12px; background-color: #f9fafb; border-radius: 6px; border-left: 3px solid #e5e7eb;">
-                    <a href="{url}" target="_blank" style="color: #4b5563; text-decoration: none; font-weight: 500; display: block; margin-bottom: 4px;">
+                <li style="margin-bottom: 10px; padding: 10px; background-color: #f8fafc; border-radius: 6px; border-left: 2px solid #d1d5db;">
+                    <a href="{url}" target="_blank" style="color: #4b5563; text-decoration: none; font-weight: 500; display: block; margin-bottom: 4px; line-height: 1.4;">
                         {title}
                     </a>
-                    <div style="color: #9ca3af; font-size: 0.85em;">
-                        <span style="margin-right: 10px;">📰 {source}</span>
-                        <span>⏰ {formatted_date}</span>
+                    <div style="color: #6b7280; font-size: 0.85em; margin-top: 4px;">
+                        <span style="margin-right: 12px;">📰 {source}</span>
+                        <span style="margin-right: 12px;">⏰ {formatted_date}</span>
+                        {similarity_badge}
                     </div>
                 </li>
                 """
             
-            html_content += f"""
+            html_content += """
                 </ul>
             </div>
-            <div style="margin-top: 10px;">
-                <a href="#" id="toggle-link-{keyword}" 
-                   style="color: #4f46e5; text-decoration: none; font-size: 0.9em; display: inline-block;">
-                    관련기사 더보기 ({len(top_items)-3}개) ▼
-                </a>
-            </div>
-            <script>
-            // 관련기사 더보기 기능
-            document.getElementById('toggle-link-{keyword}').addEventListener('click', function(e) {{
-                e.preventDefault();
-                var element = document.getElementById('related-articles-{keyword}');
-                var link = document.getElementById('toggle-link-{keyword}');
-                if (element.style.display === 'none' || !element.style.display) {{
-                    element.style.display = 'block';
-                    link.innerHTML = '간략히 보기 ▲';
-                }} else {{
-                    element.style.display = 'none';
-                    link.innerHTML = '관련기사 더보기 ({len(top_items)-3}개) ▼';
-                }}
-                return false;
-            }});
-            </script>
-            """.format(keyword=keyword.replace(' ', '-'))
+            """
         
         html_content += """
             </ul>
