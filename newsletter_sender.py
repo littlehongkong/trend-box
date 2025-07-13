@@ -229,12 +229,16 @@ def format_newsletter() -> Optional[str]:
             news_by_keyword[keyword] = []
         news_by_keyword[keyword].append(item)
     
-    # 3. 전체 요약 생성
+    # 3. 전체 요약 생성 (Vietnam.vn 제외)
     all_news_texts = [
         f"{item.get('title', '')}. {item.get('description', '')}"
         for items in news_by_keyword.values() for item in items[:3]  # 각 카테고리별 상위 3개만 사용
+        if item.get('source') != 'Vietnam.vn'  # Vietnam.vn 제외
     ]
     overall_summary = summarize_with_ai(all_news_texts, "전체 요약") if all_news_texts else None
+    
+    # 중복 제거를 위한 전역 세트
+    all_used_points = set()
     
     # 4. HTML 컨텐츠 생성 시작
     html_content = f"""
@@ -243,26 +247,66 @@ def format_newsletter() -> Optional[str]:
         <p style="color: #4a5568;">오늘의 AI/LLM 관련 최신 소식을 요약해드립니다.</p>
     """
     
-    # 5. 전체 요약 섹션 추가
+    # 5. 전체 요약 섹션 추가 (개발자 관점의 주요 하이라이트)
     if overall_summary:
         html_content += """
         <div style="margin: 20px 0; padding: 20px; background-color: #f0f9ff; border-radius: 8px; border-left: 4px solid #3b82f6;">
-            <h2 style="color: #1e40af; margin-top: 0;">📋 오늘의 주요 하이라이트</h2>
+            <h2 style="color: #1e40af; margin-top: 0;">📋 개발자 핵심 하이라이트</h2>
             <ul style="padding-left: 20px;">
         """
         
-        # 전체 요약 포인트 추가
+        # 개발자 관련 키워드 필터링
+        dev_keywords = ['API', 'SDK', '모델', '출시', '업데이트', '버전', '기술', '보안', '성능', '개발', '프레임워크', '라이브러리', '오픈소스', 'GitHub']
+        
+        # 전체 요약 포인트 추가 (개발자 관련 필터링 적용)
         points_added = 0
+        unique_points = set()
+        
         for point in [p.strip() for p in overall_summary.split('\n') if p.strip()]:
-            # 특수문자 반복 제거 (예: "..."를 "."으로 정규화)
-
-            point = re.sub(r'[.]+', '.', point)  # 여러 개의 점을 하나로
-            point = re.sub(r'[!?]+', lambda x: x.group(0)[0], point)  # 연속된 특수문자 하나로
+            # 특수문자 정규화
+            point = re.sub(r'[.]+', '.', point)
+            point = re.sub(r'[!?]+', lambda x: x.group(0)[0], point)
             
-            # 의미 있는 포인트만 추가 (최대 5개)
-            if len(point) > 5 and points_added < 5:  # 5개로 제한
-                html_content += f'<li style="margin-bottom: 8px; line-height: 1.5;">• {point}</li>'
-                points_added += 1
+            # 개발자 관련 포인트만 필터링 (중복 제거 및 최대 5개)
+            if (any(keyword in point for keyword in dev_keywords) and 
+                point not in unique_points and 
+                len(point) > 10 and 
+                points_added < 5):
+                
+                # 출처 정보 추가 (Vietnam.vn 제외)
+                source_info = ""
+                for items in news_by_keyword.values():
+                    for item in items:
+                        source = item.get('source', '')
+                        if source == 'Vietnam.vn':
+                            continue
+                        if item.get('title', '') in point or any(word in point for word in item.get('title', '').split()):
+                            if source:
+                                source_info = f'<span style="color: #4b5563; font-size: 0.9em;">(출처: {source})</span>'
+                            break
+                    if source_info:
+                        break
+                
+                # 중복 체크 및 포인트 추가
+                point_key = point.lower().strip('.!?\n\r\t ')
+                if point_key not in all_used_points:
+                    html_content += f'<li style="margin-bottom: 8px; line-height: 1.5;">{point} {source_info}</li>'
+                    all_used_points.add(point_key)
+                    points_added += 1
+        
+        # 개발자 관련 포인트가 부족한 경우, 일반 포인트로 보완
+        if points_added < 3:
+            for point in [p.strip() for p in overall_summary.split('\n') if p.strip()]:
+                point = re.sub(r'[.]+', '.', point)
+                point = re.sub(r'[!?]+', lambda x: x.group(0)[0], point)
+                
+                if (point not in unique_points and 
+                    len(point) > 10 and 
+                    points_added < 5):
+                    
+                    html_content += f'<li style="margin-bottom: 8px; line-height: 1.5;">{point}</li>'
+                    unique_points.add(point)
+                    points_added += 1
         
         html_content += """
             </ul>
@@ -313,25 +357,28 @@ def format_newsletter() -> Optional[str]:
             </div>
             """
         
-        # 상세 뉴스 항목 추가
+        # 상세 뉴스 항목 추가 (상위 3개만 기본 표시, 나머지는 접기)
         html_content += """
-            <h3 style="color: #2b6cb0; margin-top: 20px;">📰 상세 기사</h3>
-            <ul style="list-style: none; padding: 0; margin: 10px 0 0 0;">
-        """
+            <h3 style="color: #2b6cb0; margin: 20px 0 10px 0;">📰 상세 기사</h3>
+            <ul id="main-articles-{keyword}" style="list-style: none; padding: 0; margin: 0 0 10px 0;">
+        """.format(keyword=keyword.replace(' ', '-'))
         
-        for item in top_items:
+        # 상위 3개 기사 표시
+        for i, item in enumerate(top_items[:3]):
+            if item.get('source') == 'Vietnam.vn':
+                continue
+                
             title = item.get('title', '제목 없음')
             url = item.get('url', '#')
             source = item.get('source', '출처 미상')
             description = item.get('description', '')
             
-            # 발행일시 포맷팅
             pub_date = datetime.fromisoformat(item.get('pub_date', datetime.now().isoformat()))
             formatted_date = pub_date.strftime('%Y년 %m월 %d일 %H:%M')
             
             html_content += f"""
             <li style="margin-bottom: 16px; padding: 16px; background-color: white; border-radius: 6px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
-                <a href="{url}" style="color: #2b6cb0; text-decoration: none; font-weight: 600; font-size: 1.1em; display: block; margin-bottom: 6px;">
+                <a href="{url}" target="_blank" style="color: #2b6cb0; text-decoration: none; font-weight: 600; font-size: 1.1em; display: block; margin-bottom: 6px;">
                     {title}
                 </a>
                 <div style="color: #4a5568; margin: 6px 0; line-height: 1.5;">
@@ -342,10 +389,70 @@ def format_newsletter() -> Optional[str]:
                         <span style="display: inline-block; margin-right: 12px;">📰 {source}</span>
                         <span style="color: #9ca3af;">⏰ {formatted_date}</span>
                     </div>
-                    <a href="{url}" style="color: #4f46e5; text-decoration: none; font-weight: 500; white-space: nowrap;">기사 보기 →</a>
+                    <a href="{url}" target="_blank" style="color: #4f46e5; text-decoration: none; font-weight: 500; white-space: nowrap;">기사 보기 →</a>
                 </div>
             </li>
             """
+        
+        html_content += """
+            </ul>
+        """
+        
+        # 관련 기사 더보기 (4개 이상인 경우에만 표시)
+        if len(top_items) > 3:
+            html_content += f"""
+            <div id="related-articles-{keyword}" style="display: none; margin-top: 10px; border-top: 1px solid #e5e7eb; padding-top: 10px;">
+                <ul style="list-style: none; padding: 0; margin: 0;">
+            """.format(keyword=keyword.replace(' ', '-'))
+            
+            for item in top_items[3:]:
+                if item.get('source') == 'Vietnam.vn':
+                    continue
+                    
+                title = item.get('title', '제목 없음')
+                url = item.get('url', '#')
+                source = item.get('source', '출처 미상')
+                pub_date = datetime.fromisoformat(item.get('pub_date', datetime.now().isoformat()))
+                formatted_date = pub_date.strftime('%Y년 %m월 %d일 %H:%M')
+                
+                html_content += f"""
+                <li style="margin-bottom: 12px; padding: 12px; background-color: #f9fafb; border-radius: 6px; border-left: 3px solid #e5e7eb;">
+                    <a href="{url}" target="_blank" style="color: #4b5563; text-decoration: none; font-weight: 500; display: block; margin-bottom: 4px;">
+                        {title}
+                    </a>
+                    <div style="color: #9ca3af; font-size: 0.85em;">
+                        <span style="margin-right: 10px;">📰 {source}</span>
+                        <span>⏰ {formatted_date}</span>
+                    </div>
+                </li>
+                """
+            
+            html_content += f"""
+                </ul>
+            </div>
+            <div style="margin-top: 10px;">
+                <a href="#" id="toggle-link-{keyword}" 
+                   style="color: #4f46e5; text-decoration: none; font-size: 0.9em; display: inline-block;">
+                    관련기사 더보기 ({len(top_items)-3}개) ▼
+                </a>
+            </div>
+            <script>
+            // 관련기사 더보기 기능
+            document.getElementById('toggle-link-{keyword}').addEventListener('click', function(e) {{
+                e.preventDefault();
+                var element = document.getElementById('related-articles-{keyword}');
+                var link = document.getElementById('toggle-link-{keyword}');
+                if (element.style.display === 'none' || !element.style.display) {{
+                    element.style.display = 'block';
+                    link.innerHTML = '간략히 보기 ▲';
+                }} else {{
+                    element.style.display = 'none';
+                    link.innerHTML = '관련기사 더보기 ({len(top_items)-3}개) ▼';
+                }}
+                return false;
+            }});
+            </script>
+            """.format(keyword=keyword.replace(' ', '-'))
         
         html_content += """
             </ul>
@@ -361,6 +468,20 @@ def format_newsletter() -> Optional[str]:
         </p>
     </div>
     </div>
+    
+    <style>
+    .related-articles-toggle {{
+        color: #4f46e5;
+        text-decoration: none;
+        font-size: 0.9em;
+        display: inline-block;
+        margin-top: 5px;
+        cursor: pointer;
+    }}
+    .related-articles-toggle:hover {{
+        text-decoration: underline;
+    }}
+    </style>
     """
     
     return html_content
