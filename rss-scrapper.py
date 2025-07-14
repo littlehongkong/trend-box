@@ -110,7 +110,9 @@ def fetch_and_store_news():
                             'source': source[:200],  # Limit source length
                             'url': entry.link,
                             'keyword': keyword,
-                            'pub_date': pub_date.isoformat()
+                            'pub_date': pub_date.isoformat(),
+                            'category': category,
+                            'subcategory': keyword
                         }
 
                         # Insert or update in Supabase
