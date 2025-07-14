@@ -37,6 +37,16 @@ except Exception as e:
 
 # 키워드 목록
 KEYWORDS = ["GPT", "AI", "LLM", "ChatGPT", "Claude", "perplexity"]
+CATEGORIES = {
+    "LLM": ["GPT", "ChatGPT", "Claude", "LLaMA", "Mistral", "Mixtral", "Yi", "Command R"],
+    "검색엔진AI": ["Perplexity", "You.com", "Poe", "Phind"],
+    "오픈소스AI": ["Hugging Face", "Ollama", "GPT4All", "OpenRouter"],
+    "AI플랫폼": ["OpenAI", "Anthropic", "Google Gemini", "Meta AI", "Cohere"],
+    "생성형AI": ["Stable Diffusion", "MidJourney", "DALL·E", "Sora", "Pika", "Luma AI"],
+    "AI에이전트": ["AutoGPT", "AgentGPT", "BabyAGI", "AI Agents"],
+    "개발도구": ["LangChain", "LlamaIndex", "vLLM", "TGI", "ComfyUI", "MLC LLM", "AI Copilot", "GitHub Copilot"],
+    "기업용AI": ["Enterprise AI", "Edge AI", "TinyML", "On-Device AI"],
+}
 
 
 def generate_rss_url(keyword):
@@ -53,75 +63,77 @@ def fetch_and_store_news():
     logger.info("Starting news fetch process...")
     total_processed = 0
 
-    for keyword in KEYWORDS:
-        logger.info(f"Processing keyword: {keyword}")
-        url = generate_rss_url(keyword)
+    for category, keywords in CATEGORIES.items():
+        for keyword in keywords:
 
-        try:
-            feed = feedparser.parse(url)
-            if hasattr(feed, 'bozo_exception'):
-                logger.warning(f"Feed parsing warning for {url}: {feed.bozo_exception}")
-                continue
+            logger.info(f"Processing keyword: {keyword}")
+            url = generate_rss_url(keyword)
 
-            logger.info(f"Found {len(feed.entries)} entries for keyword: {keyword}")
-
-            keyword_processed = 0
-            for entry in feed.entries:
-                try:
-                    # Extract title and clean it
-                    title = entry.get('title', '').strip()
-                    if not title:
-                        logger.debug("Skipping entry with empty title")
-                        continue
-
-                    # Extract and clean description
-                    description = entry.get('description', '')
-                    description = re.sub(r'<[^>]+>', '', description)  # Remove HTML tags
-                    description = re.sub(r'\s+', ' ', description).strip()
-
-                    # Extract source from the entry
-                    source = 'Unknown'
-                    if hasattr(entry, 'source') and hasattr(entry.source, 'title'):
-                        source = entry.source.title
-                    elif hasattr(entry, 'author'):
-                        source = entry.author
-
-                    # Parse publication date
-                    pub_date = datetime.now()  # Default to current time
-                    if hasattr(entry, 'published_parsed') and entry.published_parsed:
-                        pub_date = datetime(*entry.published_parsed[:6])
-
-                    # Prepare data for Supabase
-                    data = {
-                        'title': title[:500],  # Limit title length
-                        'description': description[:2000],  # Limit description length
-                        'source': source[:200],  # Limit source length
-                        'url': entry.link,
-                        'keyword': keyword,
-                        'pub_date': pub_date.isoformat()
-                    }
-
-                    # Insert or update in Supabase
-                    try:
-                        result = supabase.table('ai_news').upsert(data, on_conflict='url').execute()
-                        if hasattr(result, 'data') and result.data:
-                            keyword_processed += 1
-                            logger.debug(f"Processed: {title[:50]}...")
-                        else:
-                            logger.warning(f"No data returned for: {title[:50]}...")
-                    except Exception as e:
-                        logger.error(f"Database error for '{title[:50]}...': {str(e)}")
-
-                except Exception as e:
-                    logger.error(f"Error processing entry: {str(e)}", exc_info=True)
+            try:
+                feed = feedparser.parse(url)
+                if hasattr(feed, 'bozo_exception'):
+                    logger.warning(f"Feed parsing warning for {url}: {feed.bozo_exception}")
                     continue
 
-            logger.info(f"Processed {keyword_processed} entries for keyword: {keyword}")
-            total_processed += keyword_processed
+                logger.info(f"Found {len(feed.entries)} entries for keyword: {keyword}")
 
-        except Exception as e:
-            logger.error(f"Error processing keyword {keyword}: {str(e)}", exc_info=True)
-            continue
+                keyword_processed = 0
+                for entry in feed.entries:
+                    try:
+                        # Extract title and clean it
+                        title = entry.get('title', '').strip()
+                        if not title:
+                            logger.debug("Skipping entry with empty title")
+                            continue
+
+                        # Extract and clean description
+                        description = entry.get('description', '')
+                        description = re.sub(r'<[^>]+>', '', description)  # Remove HTML tags
+                        description = re.sub(r'\s+', ' ', description).strip()
+
+                        # Extract source from the entry
+                        source = 'Unknown'
+                        if hasattr(entry, 'source') and hasattr(entry.source, 'title'):
+                            source = entry.source.title
+                        elif hasattr(entry, 'author'):
+                            source = entry.author
+
+                        # Parse publication date
+                        pub_date = datetime.now()  # Default to current time
+                        if hasattr(entry, 'published_parsed') and entry.published_parsed:
+                            pub_date = datetime(*entry.published_parsed[:6])
+
+                        # Prepare data for Supabase
+                        data = {
+                            'title': title[:500],  # Limit title length
+                            'description': description[:2000],  # Limit description length
+                            'source': source[:200],  # Limit source length
+                            'url': entry.link,
+                            'keyword': keyword,
+                            'pub_date': pub_date.isoformat()
+                        }
+
+                        # Insert or update in Supabase
+                        try:
+                            result = supabase.table('ai_news').upsert(data, on_conflict='url').execute()
+                            if hasattr(result, 'data') and result.data:
+                                keyword_processed += 1
+                                logger.debug(f"Processed: {title[:50]}...")
+                            else:
+                                logger.warning(f"No data returned for: {title[:50]}...")
+                        except Exception as e:
+                            logger.error(f"Database error for '{title[:50]}...': {str(e)}")
+
+                    except Exception as e:
+                        logger.error(f"Error processing entry: {str(e)}", exc_info=True)
+                        continue
+
+                logger.info(f"Processed {keyword_processed} entries for keyword: {keyword}")
+                total_processed += keyword_processed
+
+            except Exception as e:
+                logger.error(f"Error processing keyword {keyword}: {str(e)}", exc_info=True)
+                continue
 
     logger.info(f"News fetch process completed. Total entries processed: {total_processed}")
     return total_processed
