@@ -1,7 +1,7 @@
 import os
 import requests
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from supabase import create_client
 from dotenv import load_dotenv
 from typing import List, Dict, Any, Optional
@@ -38,27 +38,34 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 def fetch_todays_news() -> List[Dict[str, Any]]:
     """
-    오늘의 뉴스를 Supabase에서 가져옵니다.
+    최근 1시간 이내에 생성된 뉴스를 Supabase에서 가져옵니다.
     
     Returns:
-        List[Dict[str, Any]]: 오늘의 뉴스 리스트 또는 빈 리스트
+        List[Dict[str, Any]]: 최근 1시간 이내의 뉴스 리스트 또는 빈 리스트
     """
-    logger.info("Fetching today's news from Supabase...")
+    logger.info("Fetching recent news from Supabase (last 1 hour)...")
     
     try:
-        # 오늘 날짜로 필터링
-        today = datetime.now().date()
-        start_of_day = datetime.combine(today, datetime.min.time()).isoformat()
-        end_of_day = datetime.combine(today, datetime.max.time()).isoformat()
+        # 현재 시간으로부터 1시간 전 시간 계산 (KST 기준)
+        now = datetime.now()
+        one_hour_ago = now - timedelta(hours=1)
         
-        logger.debug(f"Querying news between {start_of_day} and {end_of_day}")
+        # KST 시간대를 고려하여 포맷팅 (YYYY-MM-DD HH:MM:SS)
+        time_format = '%Y-%m-%d %H:%M:%S'
+        one_hour_ago_str = one_hour_ago.strftime(time_format)
+        current_time_str = now.strftime(time_format)
         
+        logger.info(f"Querying news published between {one_hour_ago_str} and {current_time_str}")
+        
+        # pub_date 필드를 기준으로 최근 1시간 이내 발행된 기사 조회
         response = supabase.table('ai_news') \
             .select('*') \
-            .gte('pub_date', start_of_day) \
-            .lte('pub_date', end_of_day) \
+            .gte('pub_date', one_hour_ago_str) \
+            .lte('pub_date', current_time_str) \
             .order('pub_date', desc=True) \
             .execute()
+            
+        logger.info(f"Found {len(response.data) if hasattr(response, 'data') else 0} new articles")
         
         news_count = len(response.data) if hasattr(response, 'data') else 0
         logger.info(f"Fetched {news_count} news items for today")
@@ -511,8 +518,9 @@ def send_newsletter():
     
     logger.debug(f"Generated HTML content length: {len(html_content)} characters")
     
-    # 이메일 제목 설정
-    email_subject = f"🤖 AI/LLM 뉴스레터 - {datetime.now().strftime('%Y년 %m월 %d일')}"
+    # 이메일 제목 설정 (시간대 표시)
+    current_time = datetime.now()
+    email_subject = f"🤖 AI/LLM 실시간 업데이트 - {current_time.strftime('%m/%d %H:%M')} 기준"
     
     try:
         logger.info("Sending email via Resend API...")
@@ -526,8 +534,8 @@ def send_newsletter():
         })
         
         # 응답 로깅
-        if hasattr(response, 'id'):
-            logger.info(f"Email sent successfully! Email ID: {response.id}")
+        if isinstance(response, dict) and 'id' in response:
+            logger.info(f"Email sent successfully! Email ID: {response['id']}")
             return True
         else:
             logger.error(f"Unexpected response from Resend API: {response}")
