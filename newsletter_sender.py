@@ -1,17 +1,12 @@
 import os
-import requests
 import logging
-from datetime import datetime, timedelta
 from supabase import create_client
 from dotenv import load_dotenv
-from typing import List, Dict, Any, Optional
 import resend
-import re
 import time
 import difflib
-import json
-from typing import List, Dict, Any, Optional, Set
-from collections import defaultdict, Counter
+from typing import List, Dict, Any, Optional
+from collections import defaultdict
 import requests
 from datetime import datetime, timedelta
 
@@ -47,27 +42,27 @@ def fetch_todays_news() -> List[Dict[str, Any]]:
     최근 1시간 이내에 생성된 뉴스를 Supabase에서 가져옵니다.
     
     Returns:
-        List[Dict[str, Any]]: 최근 1시간 이내의 뉴스 리스트 또는 빈 리스트
+        List[Dict[str, Any]]: 최근 3시간 이내의 뉴스 리스트 또는 빈 리스트
     """
-    logger.info("Fetching recent news from Supabase (last 1 hour)...")
+    logger.info("Fetching recent news from Supabase (last 3 three)...")
     
     try:
         # 현재 시간으로부터 1시간 전 시간 계산 (KST 기준)
-        now = datetime.now()
-        one_hour_ago = now - timedelta(hours=1)
-        
+        now = datetime.utcnow()
+        three_hour_ago = now - timedelta(hours=3)
+
         # KST 시간대를 고려하여 포맷팅 (YYYY-MM-DD HH:MM:SS)
         time_format = '%Y-%m-%d %H:%M:%S'
-        one_hour_ago_str = one_hour_ago.strftime(time_format)
+        three_hour_ago_str = three_hour_ago.strftime(time_format)
         current_time_str = now.strftime(time_format)
         
-        logger.info(f"Querying news published between {one_hour_ago_str} and {current_time_str}")
+        logger.info(f"Querying news published between {three_hour_ago_str} and {current_time_str}")
         
-        # pub_date 필드를 기준으로 최근 1시간 이내 발행된 기사 조회
+        # pub_date 필드를 기준으로 최근 3시간 이내 발행된 기사 조회
         response = supabase.table('ai_news') \
             .select('*') \
-            .gte('pub_date', one_hour_ago_str) \
-            .lte('pub_date', current_time_str) \
+            .gte('created_at', three_hour_ago_str) \
+            .lte('created_at', current_time_str) \
             .order('pub_date', desc=True) \
             .execute()
             
@@ -138,8 +133,7 @@ def summarize_with_ai(texts: List[str], category: str, max_retries: int = 2) -> 
                 "prompt": prompt,
                 "max_tokens": 500,
                 "temperature": 0.7,
-                "top_p": 0.9,
-                "stop": ["\n\n"]  # 두 줄 연속 개행에서 중단
+                "top_p": 0.9
             }
             
             # API 요청 시간 측정
@@ -219,6 +213,44 @@ def summarize_with_ai(texts: List[str], category: str, max_retries: int = 2) -> 
     logger.warning(f"Failed to generate summary for category: {category} after {max_retries + 1} attempts")
     return None
 
+def normalize_text(text: str) -> str:
+    """
+    텍스트를 정규화합니다.
+    - 특수문자 제거
+    - 공백 정규화
+    - 소문자 변환
+    
+    Args:
+        text: 정규화할 텍스트
+        
+    Returns:
+        str: 정규화된 텍스트
+    """
+    import re
+    # 특수문자 제거
+    text = re.sub(r'[^\w\s]', ' ', text)
+    # 공백 정규화
+    text = ' '.join(text.split())
+    # 소문자 변환
+    return text.lower()
+
+def remove_source_suffix(text: str) -> str:
+    """
+    뉴스 제목에서 출처 정보를 제거합니다.
+    예: '제목 - 출처' -> '제목'
+    
+    Args:
+        text: 처리할 텍스트
+        
+    Returns:
+        str: 출처가 제거된 텍스트
+    """
+    # ' - ' 또는 ' | ' 또는 ' : '로 분리하여 첫 번째 부분만 취함
+    for sep in [' - ', ' | ', ' : ']:
+        if sep in text:
+            text = text.split(sep)[0].strip()
+    return text
+
 def calculate_similarity(str1: str, str2: str) -> float:
     """
     두 문자열 간의 유사도를 0~1 사이의 값으로 반환합니다.
@@ -230,7 +262,21 @@ def calculate_similarity(str1: str, str2: str) -> float:
     Returns:
         float: 0~1 사이의 유사도 점수 (1에 가까울수록 유사함)
     """
-    return difflib.SequenceMatcher(None, str1, str2).ratio()
+    # 원본 유사도
+    original_similarity = difflib.SequenceMatcher(None, str1, str2).ratio()
+    
+    # 출처 제거 후 유사도
+    clean_str1 = remove_source_suffix(str1)
+    clean_str2 = remove_source_suffix(str2)
+    clean_similarity = difflib.SequenceMatcher(None, clean_str1, clean_str2).ratio()
+    
+    # 정규화된 텍스트 유사도
+    norm_str1 = normalize_text(clean_str1)
+    norm_str2 = normalize_text(clean_str2)
+    norm_similarity = difflib.SequenceMatcher(None, norm_str1, norm_str2).ratio()
+    
+    # 가장 높은 유사도 반환
+    return max(original_similarity, clean_similarity, norm_similarity)
 
 def analyze_tech_trends(news_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
@@ -286,9 +332,11 @@ def analyze_tech_trends(news_items: List[Dict[str, Any]]) -> List[Dict[str, Any]
             trends.append({
                 'category': category,
                 'title': title,
+                'description': latest_item.get('description', ''),
                 'source': source,
                 'score': data['score'],
-                'key': trend_key
+                'key': trend_key,
+                'url': latest_item.get('url', '#')
             })
     
     # 점수 기준 정렬 및 중복 제거
@@ -301,7 +349,7 @@ def analyze_tech_trends(news_items: List[Dict[str, Any]]) -> List[Dict[str, Any]
     
     return unique_trends[:4]  # 상위 4개만 반환
 
-def remove_duplicate_news(news_items: List[Dict[str, Any]], similarity_threshold: float = 0.8) -> List[Dict[str, Any]]:
+def remove_duplicate_news(news_items: List[Dict[str, Any]], similarity_threshold: float = 0.75) -> List[Dict[str, Any]]:
     """
     제목의 유사도가 높은 중복 뉴스를 제거합니다.
     
@@ -312,182 +360,221 @@ def remove_duplicate_news(news_items: List[Dict[str, Any]], similarity_threshold
     Returns:
         List[Dict[str, Any]]: 중복이 제거된 뉴스 아이템 리스트
     """
+    if not news_items:
+        return []
+        
+    # 출처 정보가 더 긴 뉴스를 우선적으로 유지하기 위해 정렬
+    sorted_news = sorted(news_items, 
+                        key=lambda x: len(x.get('title', '')), 
+                        reverse=True)
+    
     unique_news = []
     seen_titles = []
+    removed_count = 0
     
-    for item in news_items:
+    for item in sorted_news:
         title = item.get('title', '').strip()
         if not title:
             continue
             
         is_duplicate = False
         
+        # 출처 제거된 제목으로 비교
+        clean_title = remove_source_suffix(title)
+        
         # 이미 본 제목들과 유사도 비교
-        for seen_title in seen_titles:
-            similarity = calculate_similarity(title, seen_title)
-            if similarity > similarity_threshold:
-                is_duplicate = True
-                logger.info(f"Removing duplicate article (similarity: {similarity:.2f}): {title}")
-                break
-                
+        for seen_item in unique_news:
+            seen_title = seen_item.get('title', '').strip()
+            seen_clean = remove_source_suffix(seen_title)
+            
+            # 출처가 다른 경우에만 유사도 체크
+            if clean_title != seen_clean:
+                similarity = calculate_similarity(title, seen_title)
+                if similarity > similarity_threshold:
+                    is_duplicate = True
+                    removed_count += 1
+                    logger.info(f"Removing duplicate article (similarity: {similarity:.2f}):\n  - Original: {seen_title}\n  - Duplicate: {title}")
+                    break
+        
         if not is_duplicate:
             unique_news.append(item)
-            seen_titles.append(title)
     
-    logger.info(f"Removed {len(news_items) - len(unique_news)} duplicate articles")
+    logger.info(f"Removed {removed_count} duplicate articles (kept {len(unique_news)} unique articles)")
     return unique_news
 
 def format_newsletter() -> Optional[str]:
     """
-    오늘 수집된 뉴스 기반으로 AI 툴/서비스 브리핑 형태의 HTML 뉴스레터를 생성합니다.
+    오늘 수집된 뉴스 기반으로 6개 섹션 뉴스레터 생성
+    중복 제거 후 각각 한 섹션에만 포함되도록 구성
 
     Returns:
-        str: 생성된 HTML 뉴스레터 또는 None (뉴스가 없는 경우)
+        str: 생성된 HTML 뉴스레터 또는 None
     """
     today = datetime.now().strftime('%Y년 %m월 %d일 %H:%M')
 
-    # 1. 최근 1시간 내 뉴스 수집
     news_items = fetch_todays_news()
     if not news_items:
-        print("오늘의 AI 관련 신규 서비스/업데이트 소식이 없습니다.")
+        logger.info("오늘의 AI 관련 신규 뉴스가 없습니다.")
         return None
-        
-    # 2. 중복 뉴스 제거
+
+    # 1. 중복 뉴스 제거
     news_items = remove_duplicate_news(news_items)
 
-    # 2. 신규 서비스/툴 중심으로 구성
-    service_news = [item for item in news_items if '출시' in item.get('title', '') or '서비스' in item.get('title', '') or '공개' in item.get('title', '')]
-    update_news = [item for item in news_items if item not in service_news]
+    # 2. 섹션 분류 (각 뉴스는 한 섹션에만)
+    sections = {
+        'service': [],
+        'update': [],
+        'business': [],
+        'infra': [],
+        'trend': [],
+        'others': []
+    }
 
+    used_indices = set()
+
+    for idx, item in enumerate(news_items):
+        title = item.get('title', '')
+        description = item.get('description', '')
+
+        content = f"{title} {description}"
+
+        # 🚀 신규 서비스/출시
+        if any(kw in title for kw in ['출시', '서비스', '공개', '런칭', '오픈', '발표']):
+            sections['service'].append(item)
+            used_indices.add(idx)
+            continue
+
+        # 🛠️ 업데이트/정책 변경
+        if any(kw in title for kw in ['업데이트', '변경', '패치', '개선', '정책']):
+            sections['update'].append(item)
+            used_indices.add(idx)
+            continue
+
+        # 📊 투자/비즈니스
+        if any(kw in content for kw in ['투자', '펀딩', '상장', '인수', 'M&A', '실적', '매출', '전망']):
+            sections['business'].append(item)
+            used_indices.add(idx)
+            continue
+
+        # ⚙️ 인프라/개발도구
+        if any(kw in content for kw in ['API', 'SDK', '배포', '프레임워크', '라이브러리', '오픈소스', '플러그인']):
+            sections['infra'].append(item)
+            used_indices.add(idx)
+            continue
+
+    # 📈 기술 트렌드 자동 추출 (이미 분류된 것 제외)
+    remaining_items = [item for idx, item in enumerate(news_items) if idx not in used_indices]
+    trends = analyze_tech_trends(remaining_items)
+    if trends:
+        sections['trend'] = trends
+        used_indices.update(range(len(news_items)))  # 남은 뉴스는 트렌드로 처리
+
+    # 📰 기타 뉴스 (위 분류에 해당 안 된 나머지)
+    unclassified_items = [item for idx, item in enumerate(news_items) if idx not in used_indices]
+    sections['others'].extend(unclassified_items)
+
+    # 3. HTML 생성
     html_content = f"""
     <div style="font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px;">
-        <h1 style="color: #1a365d;">🤖 AI 툴/서비스 실시간 브리핑 - {today}</h1>
-        <p style="color: #4a5568;">방금 발표된 AI 관련 서비스/툴/업데이트를 개발자에게 전달합니다.</p>
+        <h1 style="color: #1a365d;">🤖 AI 뉴스레터 - {today}</h1>
+        <p style="color: #4a5568;">실시간 수집된 AI 서비스/업데이트/트렌드를 개발자에게 전달합니다.</p>
     """
 
-    # 3. 신규 서비스/툴 섹션
-    html_content += """
-    <div style="margin-top: 30px; padding: 20px; background-color: #f7fafc; border-radius: 8px;">
-        <h2 style="color: #2d3748; border-bottom: 2px solid #e2e8f0; padding-bottom: 10px;">
-            🚀 오늘 출시된 AI 서비스/툴
-        </h2>
-        <ul style="list-style: none; padding: 0;">
-    """
+    # KST 시간 변환 함수
+    def convert_to_kst(utc_time):
+        from datetime import datetime, timezone, timedelta
+        if isinstance(utc_time, str):
+            try:
+                utc_time = datetime.fromisoformat(utc_time.replace('Z', '+00:00'))
+            except ValueError:
+                return "시간 정보 없음"
+        if utc_time.tzinfo is None:
+            utc_time = utc_time.replace(tzinfo=timezone.utc)
+        kst = timezone(timedelta(hours=9))
+        return utc_time.astimezone(kst).strftime('%Y-%m-%d %H:%M (KST)')
 
-    if service_news:
-        for item in service_news:
-            title = item.get('title', '제목 없음')
-            url = item.get('url', '#')
-            description = item.get('description', '')
-            source = item.get('source', '출처 미상')
-            pub_date = datetime.fromisoformat(item.get('pub_date', datetime.now().isoformat()))
-            formatted_date = pub_date.strftime('%Y-%m-%d %H:%M')
-
-            html_content += f"""
-            <li style="margin-bottom: 20px; background: white; padding: 16px; border-radius: 6px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
-                <a href="{url}" target="_blank" style="color: #2b6cb0; font-weight: bold; font-size: 1.1em; text-decoration: none;">{title}</a>
-                <p style="color: #4a5568; margin: 8px 0;">{description}</p>
-                <p style="color: #718096; font-size: 0.9em;">{source} | {formatted_date}</p>
+    # 섹션별 템플릿
+    def render_section(title, items):
+        if not items:
+            return ""
+        section_html = f"""
+        <div style="margin-top: 30px; padding: 20px; background-color: #f9fafb; border-radius: 8px;">
+            <h2 style="color: #2d3748; border-bottom: 2px solid #e2e8f0; padding-bottom: 10px;">{title}</h2>
+            <ul style="list-style: none; padding: 0;">
+        """
+        for item in items:
+            pub_date = item.get('pub_date')
+            pub_date_str = convert_to_kst(pub_date) if pub_date else "시간 정보 없음"
+            
+            section_html += f"""
+            <li style="margin-bottom: 25px; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.05);">
+                <a href="{item.get('url', '#')}" target="_blank" style="color: #2563eb; font-weight: 600; font-size: 1.1em; text-decoration: none; line-height: 1.4;">
+                    {item.get('title', '제목 없음')}
+                </a>
+                {f'<p style="color: #4b5563; margin: 10px 0; line-height: 1.5; font-size: 0.95em;">{item.get("description")}</p>' if item.get('description') else ''}
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 10px;">
+                    <span style="color: #6b7280; font-size: 0.85em; margin-right: 10px;">{item.get('source', '출처 미상')}</span>
+                    <span style="color: #9ca3af; font-size: 0.8em;">{pub_date_str}</span>
+                </div>
             </li>
             """
-    else:
-        html_content += "<p>오늘 출시된 신규 서비스/툴 정보가 없습니다.</p>"
+        section_html += "</ul></div>"
+        return section_html
 
-    html_content += "</ul></div>"
+    # 각 섹션 렌더링
+    html_content += render_section("🚀 오늘 출시된 AI 서비스/툴", sections['service'])
+    html_content += render_section("🛠️ 주요 업데이트/정책 변경", sections['update'])
+    html_content += render_section("📊 투자/비즈니스 관련 소식", sections['business'])
+    html_content += render_section("⚙️ AI 인프라/개발도구 소식", sections['infra'])
 
-    # 4. 업데이트/정책 변경 섹션
-    html_content += """
-    <div style="margin-top: 30px; padding: 20px; background-color: #edf2f7; border-radius: 8px;">
-        <h2 style="color: #2d3748; border-bottom: 2px solid #e2e8f0; padding-bottom: 10px;">
-            🛠️ 주요 업데이트/정책 변경
-        </h2>
-        <ul style="list-style: none; padding: 0;">
-    """
-
-    if update_news:
-        for item in update_news:
-            title = item.get('title', '제목 없음')
-            url = item.get('url', '#')
-            description = item.get('description', '')
-            source = item.get('source', '출처 미상')
-            pub_date = datetime.fromisoformat(item.get('pub_date', datetime.now().isoformat()))
-            formatted_date = pub_date.strftime('%Y-%m-%d %H:%M')
-
-            html_content += f"""
-            <li style="margin-bottom: 20px; background: white; padding: 16px; border-radius: 6px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
-                <a href="{url}" target="_blank" style="color: #2b6cb0; font-weight: bold; font-size: 1.1em; text-decoration: none;">{title}</a>
-                <p style="color: #4a5568; margin: 8px 0;">{description}</p>
-                <p style="color: #718096; font-size: 0.9em;">{source} | {formatted_date}</p>
-            </li>
-            """
-    else:
-        html_content += "<p>오늘 확인된 업데이트/정책 변경이 없습니다.</p>"
-
-    html_content += "</ul></div>"
-    
-    # 5. 현재 주목할 기술 트렌드 섹션 추가
-    tech_trends = analyze_tech_trends(update_news + service_news)
-    
-    if tech_trends:
-        # 카테고리별 색상 매핑
-        category_colors = {
-            'AI/ML': {'bg': '#ede9fe', 'text': '#5b21b6'},
-            '클라우드': {'bg': '#e0f2fe', 'text': '#0369a1'},
-            '웹/모바일': {'bg': '#fef3c7', 'text': '#92400e'},
-            '데이터': {'bg': '#dcfce7', 'text': '#166534'}
-        }
-        
+    # 기술 트렌드는 카드형으로 추가
+    if sections['trend']:
         html_content += """
         <div style="margin-top: 40px; padding: 25px; background-color: #f5f3ff; border-radius: 8px;">
-            <h2 style="color: #5b21b6; border-bottom: 2px solid #c4b5fd; padding-bottom: 10px; margin-top: 0;">
-                📈 현재 주목할 기술 트렌드
-            </h2>
-            <div style="margin-top: 20px;">
-                <h3 style="color: #5b21b6; margin-bottom: 15px;">개발자 필독! 핵심 기술 동향</h3>
-                <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 20px;">
+            <h2 style="color: #5b21b6; margin-top: 0; border-bottom: 2px solid #c4b5fd; padding-bottom: 10px;">📈 현재 주목할 기술 트렌드</h2>
+            <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 20px;">
         """
-        
-        for trend in tech_trends:
-            category = trend['category']
-            colors = category_colors.get(category, {'bg': '#f3f4f6', 'text': '#4b5563'})
+        for trend in sections['trend']:
+            pub_date = trend.get('pub_date')
+            pub_date_str = convert_to_kst(pub_date) if pub_date else ""
             
             html_content += f"""
-                <div style="background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.05);">
-                    <div style="display: flex; align-items: center; margin-bottom: 12px;">
-                        <span style="background-color: {colors['bg']}; color: {colors['text']}; font-weight: 600; padding: 4px 12px; border-radius: 12px; font-size: 0.9em;">
-                            {category}
-                        </span>
-                    </div>
-                    <h4 style="margin: 0 0 10px 0; color: #1f2937;">{trend['title']}</h4>
-                    <p style="color: #6b7280; font-size: 0.85em; margin-top: 8px;">
-                        출처: {trend['source']}
-                    </p>
+            <div style="background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.05); height: 100%; ">
+                <div style="margin-bottom: 12px;">
+                    <span style="background-color: #f3f4f6; color: #4b5563; font-weight: 600; padding: 4px 10px; border-radius: 12px; font-size: 0.85em; display: inline-block; margin-bottom: 8px;">
+                        {trend.get('category', '기타')}
+                    </span>
                 </div>
-            """
-        
-        html_content += """
-                </div>
-                <div style="margin-top: 20px; padding: 15px; background-color: #f8fafc; border-radius: 6px; border-right: 4px solid #c4b5fd;">
-                    <p style="margin: 0; color: #4b5563; font-size: 0.9em; font-style: italic;">
-                        💡 개발자 TIP: 최신 기술 트렌드를 놓치지 않으려면 공식 문서와 깃허브 트렌드를 정기적으로 확인하세요. 
-                        새로운 기술을 배울 때는 핵심 개념을 이해한 후 프로젝트에 적용해보는 것이 가장 효과적입니다.
+                <h4 style="margin: 0 0 10px 0; font-size: 1.1em; line-height: 1.4;">
+                    <a href="{trend.get('url', '#')}" target="_blank" style="color: #1f2937; text-decoration: none;">
+                        {trend.get('title', '제목 없음')}
+                    </a>
+                </h4>
+                {f'<p style="color: #4b5563; margin: 10px 0 15px 0; font-size: 0.95em; line-height: 1.5; flex-grow: 1;">{trend.get("description", "")}</p>' if trend.get('description') else '<div style="flex-grow: 1;"></div>'}
+                <div style="margin-top: auto;">
+                    <p style="color: #6b7280; font-size: 0.85em; margin: 5px 0 0 0;">
+                        출처: <a href="{trend.get('url', '#')}" target="_blank" style="color: #6b7280; text-decoration: underline;">{trend.get('source', '출처 없음')}</a>
+                        {f'<span style="color: #9ca3af; margin-left: 10px;">{pub_date_str}</span>' if pub_date_str else ''}
                     </p>
                 </div>
             </div>
-        </div>
-        """
+            """
+        html_content += "</div></div>"
 
-    # 6. 푸터 추가
+    # 기타 뉴스
+    html_content += render_section("📰 기타 AI 업계 소식", sections['others'])
+
+    # 푸터
     html_content += f"""
     <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #e5e7eb; color: #6b7280; font-size: 0.9em;">
-        <p>이 뉴스레터는 실시간으로 수집된 AI 정보로 구성됩니다.</p>
-        <p>수신 거부를 원하시면 회신 바랍니다.</p>
-        <p style="margin-top: 10px; font-size: 0.9em;">발신: AI 레이더 | {today} 발행</p>
+        <p>이 뉴스레터는 AI 분야 실시간 정보를 기반으로 자동 생성됩니다.</p>
+        <p style="margin-top: 10px;">발행 시각: {today}</p>
     </div>
     </div>
     """
 
     return html_content
+
 
 
 def send_newsletter():

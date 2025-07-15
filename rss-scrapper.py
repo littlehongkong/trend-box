@@ -44,7 +44,7 @@ CATEGORIES = {
     "AI플랫폼": ["OpenAI", "Anthropic", "Google Gemini", "Meta AI", "Cohere"],
     "생성형AI": ["Stable Diffusion", "MidJourney", "DALL·E", "Sora", "Pika", "Luma AI"],
     "AI에이전트": ["AutoGPT", "AgentGPT", "BabyAGI", "AI Agents"],
-    "개발도구": ["LangChain", "LlamaIndex", "vLLM", "TGI", "ComfyUI", "MLC LLM", "AI Copilot", "GitHub Copilot"],
+    "개발도구": ["LangChain", "LangGraph", "LlamaIndex", "vLLM", "TGI", "ComfyUI", "MLC LLM", "AI Copilot", "GitHub Copilot", "Cursor", "Windsurf"],
     "기업용AI": ["Enterprise AI", "Edge AI", "TinyML", "On-Device AI"],
 }
 
