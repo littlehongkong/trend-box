@@ -806,7 +806,7 @@ class NewsProcessor:
                     'section_title': self.section_titles.get(category_key, category_key),
                     'content': section_content,
                     'summary': summary_text,
-                    'display_order': len(CATEGORY_MAPPING) - list(CATEGORY_MAPPING.values()).index(category_key),
+                    'display_order': list(CATEGORY_MAPPING.values()).index(category_key) + 1,  # 1-based index
                     'publish_date': self.today.strftime('%Y-%m-%d'),
                     'is_published': False,
                     'updated_at': datetime.now(timezone.utc).isoformat()
