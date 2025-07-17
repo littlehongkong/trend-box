@@ -4,9 +4,7 @@ on:
   push:
     branches: [main]
   schedule:
-    - cron: '0 0 * * *'   # 오전 8시 (KST)
-    - cron: '0 3 * * *'   # 오후 12시 (KST)
-    - cron: '0 9 * * *'   # 오후 6시 (KST)
+    - cron: '0 */3 * * *'
 
 jobs:
   build:
@@ -32,4 +30,5 @@ jobs:
         run: |
           set -e
           python rss-scrapper.py
+          python news_data_processor.py
           python newsletter_sender.py

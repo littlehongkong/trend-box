@@ -404,174 +404,126 @@ def remove_duplicate_news(news_items: List[Dict[str, Any]], similarity_threshold
 
 def format_newsletter() -> Optional[str]:
     """
-    오늘 수집된 뉴스 기반으로 6개 섹션 뉴스레터 생성
-    중복 제거 후 각각 한 섹션에만 포함되도록 구성
-
+    Supabase의 newsletter_sections 테이블에서 오늘 날짜의 섹션들을 가져와 뉴스레터를 생성합니다.
+    
     Returns:
         str: 생성된 HTML 뉴스레터 또는 None
     """
-    today = datetime.now().strftime('%Y년 %m월 %d일 %H:%M')
-
-    news_items = fetch_todays_news()
-    if not news_items:
-        logger.info("오늘의 AI 관련 신규 뉴스가 없습니다.")
-        return None
-
-    # 1. 중복 뉴스 제거
-    news_items = remove_duplicate_news(news_items)
-
-    # 2. 섹션 분류 (각 뉴스는 한 섹션에만)
-    sections = {
-        'service': [],
-        'update': [],
-        'business': [],
-        'infra': [],
-        'trend': [],
-        'others': []
-    }
-
-    used_indices = set()
-
-    for idx, item in enumerate(news_items):
-        title = item.get('title', '')
-        description = item.get('description', '')
-
-        content = f"{title} {description}"
-
-        # 🚀 신규 서비스/출시
-        if any(kw in title for kw in ['출시', '서비스', '공개', '런칭', '오픈', '발표']):
-            sections['service'].append(item)
-            used_indices.add(idx)
-            continue
-
-        # 🛠️ 업데이트/정책 변경
-        if any(kw in title for kw in ['업데이트', '변경', '패치', '개선', '정책']):
-            sections['update'].append(item)
-            used_indices.add(idx)
-            continue
-
-        # 📊 투자/비즈니스
-        if any(kw in content for kw in ['투자', '펀딩', '상장', '인수', 'M&A', '실적', '매출', '전망']):
-            sections['business'].append(item)
-            used_indices.add(idx)
-            continue
-
-        # ⚙️ 인프라/개발도구
-        if any(kw in content for kw in ['API', 'SDK', '배포', '프레임워크', '라이브러리', '오픈소스', '플러그인']):
-            sections['infra'].append(item)
-            used_indices.add(idx)
-            continue
-
-    # 📈 기술 트렌드 자동 추출 (이미 분류된 것 제외)
-    remaining_items = [item for idx, item in enumerate(news_items) if idx not in used_indices]
-    trends = analyze_tech_trends(remaining_items)
-    if trends:
-        sections['trend'] = trends
-        used_indices.update(range(len(news_items)))  # 남은 뉴스는 트렌드로 처리
-
-    # 📰 기타 뉴스 (위 분류에 해당 안 된 나머지)
-    unclassified_items = [item for idx, item in enumerate(news_items) if idx not in used_indices]
-    sections['others'].extend(unclassified_items)
-
-    # 3. HTML 생성
-    html_content = f"""
-    <div style="font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px;">
-        <h1 style="color: #1a365d;">🤖 AI 뉴스레터 - {today}</h1>
-        <p style="color: #4a5568;">실시간 수집된 AI 서비스/업데이트/트렌드를 개발자에게 전달합니다.</p>
-    """
-
-    # KST 시간 변환 함수
-    def convert_to_kst(utc_time):
-        from datetime import datetime, timezone, timedelta
-        if isinstance(utc_time, str):
-            try:
-                utc_time = datetime.fromisoformat(utc_time.replace('Z', '+00:00'))
-            except ValueError:
-                return "시간 정보 없음"
-        if utc_time.tzinfo is None:
-            utc_time = utc_time.replace(tzinfo=timezone.utc)
-        kst = timezone(timedelta(hours=9))
-        return utc_time.astimezone(kst).strftime('%Y-%m-%d %H:%M (KST)')
-
-    # 섹션별 템플릿
-    def render_section(title, items):
-        if not items:
-            return ""
-        section_html = f"""
-        <div style="margin-top: 30px; padding: 20px; background-color: #f9fafb; border-radius: 8px;">
-            <h2 style="color: #2d3748; border-bottom: 2px solid #e2e8f0; padding-bottom: 10px;">{title}</h2>
-            <ul style="list-style: none; padding: 0;">
-        """
-        for item in items:
-            pub_date = item.get('pub_date')
-            pub_date_str = convert_to_kst(pub_date) if pub_date else "시간 정보 없음"
+    # KST 기준 오늘 날짜 (YYYY-MM-DD)
+    today_kst = datetime.now().strftime('%Y-%m-%d')
+    logger.info(f"Fetching newsletter sections for date: {today_kst}")
+    
+    try:
+        # Supabase에서 오늘 날짜의 섹션 조회 (is_published=True인 항목만)
+        response = supabase.table('newsletter_sections') \
+            .select('*') \
+            .eq('publish_date', today_kst) \
+            .eq('is_published', True) \
+            .order('display_order') \
+            .execute()
+        
+        sections = response.data if hasattr(response, 'data') else []
+        
+        if not sections:
+            logger.info(f"No published sections found for date: {today_kst}")
+            return None
             
-            section_html += f"""
-            <li style="margin-bottom: 25px; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.05);">
-                <a href="{item.get('url', '#')}" target="_blank" style="color: #2563eb; font-weight: 600; font-size: 1.1em; text-decoration: none; line-height: 1.4;">
-                    {item.get('title', '제목 없음')}
-                </a>
-                {f'<p style="color: #4b5563; margin: 10px 0; line-height: 1.5; font-size: 0.95em;">{item.get("description")}</p>' if item.get('description') else ''}
-                <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 10px;">
-                    <span style="color: #6b7280; font-size: 0.85em; margin-right: 10px;">{item.get('source', '출처 미상')}</span>
-                    <span style="color: #9ca3af; font-size: 0.8em;">{pub_date_str}</span>
-                </div>
-            </li>
-            """
-        section_html += "</ul></div>"
-        return section_html
-
-    # 각 섹션 렌더링
-    html_content += render_section("🚀 오늘 출시된 AI 서비스/툴", sections['service'])
-    html_content += render_section("🛠️ 주요 업데이트/정책 변경", sections['update'])
-    html_content += render_section("📊 투자/비즈니스 관련 소식", sections['business'])
-    html_content += render_section("⚙️ AI 인프라/개발도구 소식", sections['infra'])
-
-    # 기술 트렌드는 카드형으로 추가
-    if sections['trend']:
-        html_content += """
-        <div style="margin-top: 40px; padding: 25px; background-color: #f5f3ff; border-radius: 8px;">
-            <h2 style="color: #5b21b6; margin-top: 0; border-bottom: 2px solid #c4b5fd; padding-bottom: 10px;">📈 현재 주목할 기술 트렌드</h2>
-            <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 20px;">
+        logger.info(f"Found {len(sections)} sections for today's newsletter")
+        
+        # HTML 생성
+        html_content = f"""
+        <div style="font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px;">
+            <h1 style="color: #1a365d;">📰 AI 뉴스레터 - {today_kst}</h1>
+            <p style="color: #4a5568;">AI 분야의 최신 소식과 인사이트를 전해드립니다.</p>
         """
-        for trend in sections['trend']:
-            pub_date = trend.get('pub_date')
-            pub_date_str = convert_to_kst(pub_date) if pub_date else ""
+        
+        # 섹션별 렌더링
+        for section in sections:
+            section_name = section.get('section_name', '')
+            section_title = section.get('section_title', '')
+            content = section.get('content', [])
+            summary = section.get('summary', '')
             
+            if not content or not isinstance(content, list):
+                logger.warning(f"Skipping section {section_name} - invalid content format")
+                continue
+                
+            # 섹션 헤더
             html_content += f"""
-            <div style="background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.05); height: 100%; ">
-                <div style="margin-bottom: 12px;">
-                    <span style="background-color: #f3f4f6; color: #4b5563; font-weight: 600; padding: 4px 10px; border-radius: 12px; font-size: 0.85em; display: inline-block; margin-bottom: 8px;">
-                        {trend.get('category', '기타')}
-                    </span>
+            <div style="margin-top: 30px; padding: 20px; background-color: #f9fafb; border-radius: 8px;">
+                <h2 style="color: #2d3748; border-bottom: 2px solid #e2e8f0; padding-bottom: 10px;">
+                    {section_title}
+                </h2>
+            """
+            
+            # 요약이 있는 경우 표시
+            if summary:
+                html_content += f"""
+                <div style="background: #edf2f7; padding: 12px 15px; border-radius: 6px; margin-bottom: 15px; font-size: 0.95em; line-height: 1.5; color: #2d3748;">
+                    {summary}
                 </div>
-                <h4 style="margin: 0 0 10px 0; font-size: 1.1em; line-height: 1.4;">
-                    <a href="{trend.get('url', '#')}" target="_blank" style="color: #1f2937; text-decoration: none;">
-                        {trend.get('title', '제목 없음')}
+                """
+            
+            # 콘텐츠 항목들
+            html_content += """
+                <div style="margin-top: 15px;">
+                    <ul style="list-style: none; padding: 0; margin: 0;">
+            """
+            
+            # 각 콘텐츠 항목 렌더링
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                    
+                title = item.get('title', '')
+                url = item.get('url', '#')
+                description = item.get('description', '')
+                source = item.get('source', '')
+                
+                html_content += f"""
+                <li style="margin-bottom: 20px; background: white; padding: 18px; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.05);">
+                    <a href="{url}" target="_blank" style="color: #2563eb; font-weight: 600; font-size: 1.05em; text-decoration: none; line-height: 1.4; display: block; margin-bottom: 8px;">
+                        {title}
                     </a>
-                </h4>
-                {f'<p style="color: #4b5563; margin: 10px 0 15px 0; font-size: 0.95em; line-height: 1.5; flex-grow: 1;">{trend.get("description", "")}</p>' if trend.get('description') else '<div style="flex-grow: 1;"></div>'}
-                <div style="margin-top: auto;">
-                    <p style="color: #6b7280; font-size: 0.85em; margin: 5px 0 0 0;">
-                        출처: <a href="{trend.get('url', '#')}" target="_blank" style="color: #6b7280; text-decoration: underline;">{trend.get('source', '출처 없음')}</a>
-                        {f'<span style="color: #9ca3af; margin-left: 10px;">{pub_date_str}</span>' if pub_date_str else ''}
+                """
+                
+                if description:
+                    html_content += f"""
+                    <p style="color: #4b5563; margin: 8px 0 10px 0; line-height: 1.5; font-size: 0.95em;">
+                        {description}
                     </p>
+                    """
+                
+                if source:
+                    html_content += f"""
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 10px;">
+                        <span style="color: #6b7280; font-size: 0.85em;">{source}</span>
+                    </div>
+                    """
+                
+                html_content += "</li>"
+            
+            # 섹션 닫기
+            html_content += """
+                    </ul>
                 </div>
             </div>
             """
-        html_content += "</div></div>"
-
-    # 기타 뉴스
-    html_content += render_section("📰 기타 AI 업계 소식", sections['others'])
-
-    # 푸터
-    html_content += f"""
-    <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #e5e7eb; color: #6b7280; font-size: 0.9em;">
-        <p>이 뉴스레터는 AI 분야 실시간 정보를 기반으로 자동 생성됩니다.</p>
-        <p style="margin-top: 10px;">발행 시각: {today}</p>
-    </div>
-    </div>
-    """
+        
+        # 푸터
+        html_content += f"""
+        <div style="margin-top: 40px; padding-top: 20px; border-top: 1px solid #e5e7eb; color: #6b7280; font-size: 0.9em;">
+            <p>이 뉴스레터는 {today_kst} 기준으로 작성되었습니다.</p>
+            <p style="margin-top: 10px;">뉴스레터 구독을 원하지 않으시면 <a href="#" style="color: #4f46e5;">여기</a>를 클릭해 구독을 취소하실 수 있습니다.</p>
+        </div>
+        </div>
+        """
+        
+        return html_content
+        
+    except Exception as e:
+        logger.error(f"Error formatting newsletter: {str(e)}", exc_info=True)
+        return None
 
     return html_content
 
