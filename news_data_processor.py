@@ -355,30 +355,45 @@ class NewsProcessor:
         
         Returns:
             List of news items from today that haven't been marked as duplicates
+            
+        Note:
+            Date range is set to KST 00:00:00 to 23:59:59.999 of the current day
+            which translates to UTC 15:00:00 (previous day) to 14:59:59.999 (current day)
         """
         try:
-            # Define timezone
-            kst = pytz.timezone('Asia/Seoul')
-            utc = pytz.utc
-
-            # 오늘의 시작과 끝 (KST 기준)
-            kst_now = datetime.now(kst) - timedelta(days=1)
-            start_of_day_kst = kst_now.replace(hour=0, minute=0, second=0, microsecond=0)
-            end_of_day_kst = start_of_day_kst + timedelta(days=1)
-
-            # UTC로 변환
-            start_utc = start_of_day_kst.astimezone(utc).isoformat()
-            end_utc = end_of_day_kst.astimezone(utc).isoformat()
-
-            # Supabase 쿼리: pub_date가 이 범위 사이에 있는 데이터 조회
-            response = supabase.table('ai_news') \
+            # Get current date in KST
+            kst = timezone(timedelta(hours=9))
+            utc = timezone.utc
+            
+            # Get current date components in KST
+            kst_now = datetime.now(kst)
+            year = kst_now.year
+            month = kst_now.month
+            day = kst_now.day
+            
+            # Calculate UTC time range that corresponds to KST 00:00:00 - 23:59:59.999
+            # KST 00:00:00 = UTC 15:00:00 (previous day)
+            utc_start = datetime(year, month, day - 1, 15, 0, 0, 0, tzinfo=utc)
+            # KST 23:59:59.999 = UTC 14:59:59.999 (current day)
+            utc_end = datetime(year, month, day, 14, 59, 59, 999000, tzinfo=utc)
+            
+            logger.info(f"Fetching news from {utc_start} to {utc_end}")
+            
+            # Query Supabase with UTC time range
+            response = self.supabase.table('ai_news') \
                 .select('*') \
-                .gte('pub_date', start_utc) \
-                .lt('pub_date', end_utc) \
+                .gte('pub_date', utc_start.isoformat()) \
+                .lte('pub_date', utc_end.isoformat()) \
                 .order('pub_date', desc=True) \
                 .execute()
                 
-            return response.data if response.data else []
+            if not response.data:
+                logger.warning("No news items found in the database for the specified time range.")
+                return []
+                
+            logger.info(f"Found {len(response.data)} news items in the database.")
+            return response.data
+            
         except Exception as e:
             logger.error(f"Error fetching today's news: {str(e)}")
             return []
