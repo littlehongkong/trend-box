@@ -36,7 +36,6 @@ except Exception as e:
     raise
 
 # 키워드 목록
-KEYWORDS = ["GPT", "AI", "LLM", "ChatGPT", "Claude", "perplexity"]
 CATEGORIES = {
     "LLM": ["GPT", "ChatGPT", "Claude", "LLaMA", "Mistral", "Mixtral", "Yi", "Command R"],
     "검색엔진AI": ["Perplexity", "You.com", "Poe", "Phind"],
