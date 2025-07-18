@@ -5,12 +5,14 @@ on:
     branches: [main]
   schedule:
     # Run every 3 hours
-    - cron: '0 */3 * * *'
+    - cron: '0 */3 * * *'     # Data collection
+    - cron: '0 23 * * *'      # Newsletter (8:00 AM KST)
 
 jobs:
   data-collection:
     name: Data Collection and Processing
     runs-on: ubuntu-latest
+    if: github.event_name != 'schedule' || github.event.schedule == '0 */3 * * *'
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -36,11 +38,7 @@ jobs:
   send-newsletter:
     name: Send Newsletter
     runs-on: ubuntu-latest
-    needs: data-collection
-    if: github.event_name == 'schedule'  # Only run on schedule, not on push
-    schedule:
-      # Run every day at 8:00 AM KST (23:00 UTC)
-      - cron: '0 23 * * *'
+    if: github.event_name == 'schedule' && github.event.schedule == '0 23 * * *'
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
