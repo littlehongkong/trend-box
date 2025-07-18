@@ -31,3 +31,4 @@ typing-inspection==0.4.1
 typing_extensions==4.14.1
 websockets==15.0.1
 resend==2.11.0
+pytz==2025.2
