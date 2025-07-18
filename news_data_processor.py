@@ -628,6 +628,39 @@ class NewsProcessor:
         
         logger.info("News processing completed successfully.")
     
+    def _clean_title(self, title: str) -> str:
+        """Clean title by replacing single quotes with similar-looking special characters
+        
+        Args:
+            title: The title to clean
+            
+        Returns:
+            str: Cleaned title with single quotes replaced
+        """
+        if not title:
+            return title
+            
+        # Replace single quotes with similar-looking special characters
+        # Left single quote with '`' (backtick)
+        # Right single quote with '\u2019' (right single quotation mark)
+        # Single quote in the middle of a word with '\u02BC' (modifier letter apostrophe)
+        cleaned = title.replace("'", "\u2019")  # Replace all single quotes with right single quotation mark
+        
+        # Handle cases where single quotes are used as apostrophes in the middle of words
+        cleaned = cleaned.replace("\u2019s ", "\u02BCs ")  # 's -> ʼs
+        cleaned = cleaned.replace("\u2019t ", "\u02BCt ")  # 't -> ʼt
+        cleaned = cleaned.replace("\u2019re ", "\u02BCre ") # 're -> ʼre
+        cleaned = cleaned.replace("\u2019ve ", "\u02BCve ") # 've -> ʼve
+        cleaned = cleaned.replace("\u2019ll ", "\u02BCll ") # 'll -> ʼll
+        cleaned = cleaned.replace("\u2019d ", "\u02BCd ")   # 'd -> ʼd
+        cleaned = cleaned.replace("\u2019m ", "\u02BCm ")   # 'm -> ʼm
+        
+        # Handle leading single quotes (like in contractions or quotes at the beginning)
+        if cleaned.startswith("\u2019"):
+            cleaned = "`" + cleaned[1:]
+            
+        return cleaned
+
     def _get_todays_news(self) -> List[Dict[str, Any]]:
         """Fetch today's news from the database
         
@@ -671,6 +704,12 @@ class NewsProcessor:
                 return []
                 
             logger.info(f"Found {len(response.data)} news items in the database.")
+            
+            # Clean titles before returning
+            for item in response.data:
+                if 'title' in item and item['title']:
+                    item['title'] = self._clean_title(item['title'])
+                    
             return response.data
             
         except Exception as e:
