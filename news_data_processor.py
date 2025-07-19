@@ -1,1273 +1,825 @@
 import os
-import logging
-from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Any, Union
-from dotenv import load_dotenv
-from supabase import create_client
-import httpx
-import asyncio
-import re
 import json
+import re
+import time
+import logging
+from datetime import datetime, timezone, timedelta
+from typing import List, Dict, Any, Optional
+from difflib import SequenceMatcher
 import uuid
 
-# Configure logging
+import requests
+from supabase import create_client, Client
+from dotenv import load_dotenv
+
+# 로깅 설정
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('news_processor.log', encoding='utf-8')
+        logging.FileHandler('news_processor.log', encoding='utf-8'),
+        logging.StreamHandler()
     ]
 )
-logger = logging.getLogger('news_processor')
+logger = logging.getLogger(__name__)
 
-# Load environment variables
-load_dotenv()
-
-# Configuration
-TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY")
-TOGETHER_API_URL = "https://api.together.xyz/v1/chat/completions"
-MODEL_NAME = "meta-llama/Llama-3-70b-chat-hf"
-BATCH_SIZE = 50  # Number of headlines to process in one batch
-
-# Supabase setup
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-if not all([SUPABASE_URL, SUPABASE_KEY]):
-    logger.error("Supabase credentials not found in environment variables")
-    raise ValueError("Missing Supabase credentials")
-
-try:
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-    logger.info("Successfully connected to Supabase")
-except Exception as e:
-    logger.error(f"Failed to connect to Supabase: {str(e)}")
-    raise
-
-# Category mapping for database storage
-CATEGORY_MAPPING = {
-    "🚀 New Services/Launches": "new_services",
-    "🛠️ Updates/Policy Changes": "updates_policy",
-    "📊 Investment/Business": "investment_business",
-    "⚙️ Infrastructure/Dev Tools": "infrastructure",
-    "📈 Technology Trends (Auto)": "tech_trends",
-    "📰 Other News": "other_news"
-}
 
 class NewsClassifier:
+    """Together.ai LLM API를 사용하여 뉴스 분류 및 요약을 처리하는 클래스"""
+
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self.headers = {
-            "Authorization": f"Bearer {api_key}",
+        self.base_url = "https://api.together.xyz/v1/chat/completions"
+        self.model = "meta-llama/Llama-3-70b-chat-hf"
+        self.max_chunk_size = 2000
+
+        # 뉴스 카테고리 정의
+        self.categories = {
+            "new_services": "New Services/Launches",
+            "updates": "Updates/Policy Changes",
+            "investment": "Investment/Business",
+            "infrastructure": "Infrastructure/Dev Tools",
+            "trends": "Technology Trends",
+            "other": "Other News"
+        }
+
+    def _make_api_request(self, messages: List[Dict], temperature: float = 0.5, max_tokens: int = 2000) -> Optional[
+        Dict]:
+        """Together.ai API 호출"""
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json"
         }
-        self.max_chunk_size = 2000  # Reduced chunk size to be safer
 
-    async def process_headlines(self, headlines: List[str]) -> Dict[str, Any]:
-        """Process headlines to get both classification and summary using Together.ai
-        
-        Args:
-            headlines: List of news headlines to process
-            
-        Returns:
-            Dict containing 'classification' and 'summary' keys with their respective data
-        """
-        if not headlines:
-            return {"classification": {}, "summary": {}}
-
-        # Phase 1: Classification only
-        classification_results = await self._classify_headlines(headlines)
-        
-        # Phase 2: Summarization based on classified results
-        summary_results = await self._summarize_headlines(classification_results)
-        
-        return {
-            "classification": classification_results,
-            "summary": summary_results
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "timeout": 120
         }
-    
-    async def _classify_headlines(self, headlines: List[str]) -> Dict[str, List[str]]:
-        """Classify headlines into categories"""
-        if not headlines:
-            return {}
 
-        # Process in chunks
-        all_results = {category: [] for category in CATEGORY_MAPPING.keys()}
-        current_chunk = []
-        current_length = 0
+        request_id = str(uuid.uuid4())[:8]
+        logger.info(f"API 요청 시작 (ID: {request_id})")
 
-        for headline in headlines:
-            headline_length = len(headline) + 10  # Buffer for formatting
-            
-            if current_chunk and (current_length + headline_length) > self.max_chunk_size:
-                chunk_result = await self._process_classification_chunk(current_chunk)
-                self._merge_classification_results(all_results, chunk_result)
-                current_chunk = []
-                current_length = 0
-            
-            current_chunk.append(headline)
-            current_length += headline_length
-        
-        if current_chunk:
-            chunk_result = await self._process_classification_chunk(current_chunk)
-            self._merge_classification_results(all_results, chunk_result)
-        
-        return all_results
-    
-    async def _summarize_headlines(self, classified_news: Dict[str, List[str]]) -> Dict[str, List[str]]:
-        """Generate summaries for classified headlines"""
-        if not classified_news or not any(classified_news.values()):
-            return {}
-            
-        summary_results = {category: [] for category in CATEGORY_MAPPING.keys()}
-        
-        for category, headlines in classified_news.items():
-            if not headlines:
-                continue
-                
-            # Process in chunks if there are many headlines
-            chunk_size = 10  # Smaller chunk size for summarization
-            for i in range(0, len(headlines), chunk_size):
-                chunk = headlines[i:i + chunk_size]
-                summary = await self._process_summary_chunk(category, chunk)
-                if summary and category in summary_results:
-                    summary_results[category].extend(summary.get(category, []))
-        
-        return summary_results
-
-    async def _process_classification_chunk(self, headlines: List[str]) -> Dict[str, List[str]]:
-        """Process a single chunk of headlines for classification only"""
-        if not headlines:
-            logger.warning("No headlines provided for classification")
-            return {}
-            
-        prompt = self._build_classification_prompt(headlines)
-        logger.info(f"Classifying {len(headlines)} headlines, prompt length: {len(prompt)} chars")
-        logger.debug(f"Classification prompt: {prompt[:500]}...")
-        
         try:
-            logger.info("Sending request to Together API...")
-            response = await self._make_api_request(prompt)
-            
-            if not response:
-                logger.error("No response received from API")
-                return {}
-                
-            logger.debug(f"API Response: {json.dumps(response, ensure_ascii=False, indent=2)[:1000]}...")
-            
-            if 'choices' not in response or not response['choices']:
-                logger.error(f"Unexpected API response format: {response}")
-                return {}
-                
-            message = response['choices'][0].get('message', {})
-            if not message or 'content' not in message:
-                logger.error(f"No content in API response: {response}")
-                return {}
-                
-            content = message['content']
-            logger.debug(f"Raw classification content: {content[:1000]}...")
-            
-            # Save raw response for debugging
-            with open('classification_response.txt', 'w', encoding='utf-8') as f:
-                f.write(content)
-                
-            result = self._parse_classification_response(content)
-            logger.info(f"Successfully parsed {sum(len(items) for items in result.values())} classified items")
+            response = requests.post(self.base_url, headers=headers, json=payload, timeout=120)
+            response.raise_for_status()
+
+            result = response.json()
+
+            # 디버깅용 파일 저장
+            with open(f"api_request_{request_id}.json", "w", encoding="utf-8") as f:
+                json.dump({"payload": payload, "response": result}, f, ensure_ascii=False, indent=2)
+
+            logger.info(f"API 요청 성공 (ID: {request_id})")
             return result
-            
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"API 요청 실패 (ID: {request_id}): {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                logger.error(f"응답 상태 코드: {e.response.status_code}")
+                logger.error(f"응답 내용: {e.response.text}")
+            return None
         except Exception as e:
-            logger.error(f"Error in classification: {str(e)}", exc_info=True)
-            # Save error context for debugging
-            try:
-                with open('classification_error.txt', 'w', encoding='utf-8') as f:
-                    f.write(f"Error: {str(e)}\n\n")
-                    f.write(f"Response: {str(response) if 'response' in locals() else 'No response'}\n")
-            except Exception as save_error:
-                logger.error(f"Failed to save error details: {save_error}")
-            return {}
-    
-    async def _process_summary_chunk(self, category: str, headlines: List[str]) -> Dict[str, List[str]]:
-        """Process a single chunk of headlines for summarization"""
-        if not headlines or not category:
-            return {}
-            
-        prompt = self._build_summary_prompt(category, headlines)
-        logger.info(f"Summarizing {len(headlines)} headlines for {category}, prompt length: {len(prompt)} chars")
-        
+            logger.error(f"예상치 못한 오류 (ID: {request_id}): {e}")
+            return None
+
+    def _parse_json_response(self, text: str, request_id: str) -> Optional[Dict]:
+        """JSON 응답 파싱 - 개선된 버전"""
         try:
-            response = await self._make_api_request(prompt)
-            if not response:
-                return {}
-                
-            content = response['choices'][0]['message']['content']
-            return self._parse_summary_response(category, content)
-            
-        except Exception as e:
-            logger.error(f"Error in summarization: {str(e)}", exc_info=True)
-            return {}
-    
-    async def _make_api_request(self, prompt: str) -> Dict[str, Any]:
-        """Make API request to Together API"""
-        request_id = str(uuid.uuid4())[:8]  # Generate a unique ID for this request
-        logger.info(f"[Req {request_id}] Sending API request to {TOGETHER_API_URL}")
-        
-        try:
-            request_data = {
-                "model": MODEL_NAME,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.3,
-                "max_tokens": 4000
-            }
-            
-            # Log request details (without the full prompt)
-            logger.debug(f"[Req {request_id}] Request data: {json.dumps({
-                'model': MODEL_NAME,
-                'message_length': len(prompt),
-                'temperature': 0.3
-            })}")
-            
-            # Save the full request for debugging
-            with open(f'api_request_{request_id}.json', 'w', encoding='utf-8') as f:
-                json.dump({
-                    'url': TOGETHER_API_URL,
-                    'headers': {k: '***' if k.lower() == 'authorization' else v 
-                              for k, v in self.headers.items()},
-                    'data': request_data
-                }, f, ensure_ascii=False, indent=2)
-            
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                # Log the request
-                logger.debug(f"[Req {request_id}] Sending request to {TOGETHER_API_URL}")
-                
-                try:
-                    response = await client.post(
-                        TOGETHER_API_URL,
-                        headers=self.headers,
-                        json=request_data
-                    )
-                    
-                    # Log response status and headers
-                    logger.info(f"[Req {request_id}] Response status: {response.status_code}")
-                    logger.debug(f"[Req {request_id}] Response headers: {dict(response.headers)}")
-                    
-                    # Handle error responses
-                    if response.status_code >= 400:
-                        error_detail = response.text
-                        logger.error(f"[Req {request_id}] API Error {response.status_code}: {error_detail}")
-                        
-                        # Save error response for debugging
-                        with open(f'api_error_{request_id}.txt', 'w', encoding='utf-8') as f:
-                            f.write(f"Status: {response.status_code}\n")
-                            f.write(f"Headers: {dict(response.headers)}\n\n")
-                            f.write(error_detail)
-                        
-                        if response.status_code == 422:
-                            logger.error(f"[Req {request_id}] Problematic prompt (first 500 chars): {prompt[:500]}...")
-                        return None
-                    
-                    # Parse the successful response
-                    try:
-                        result = response.json()
-                        logger.debug(f"[Req {request_id}] Successfully parsed JSON response")
-                        
-                        # Save the full response for debugging
-                        with open(f'api_response_{request_id}.json', 'w', encoding='utf-8') as f:
-                            json.dump(result, f, ensure_ascii=False, indent=2)
-                        
-                        if 'choices' not in result or not result['choices']:
-                            logger.error(f"[Req {request_id}] Unexpected response format: 'choices' not found")
-                            return None
-                            
-                        return result
-                        
-                    except json.JSONDecodeError as e:
-                        logger.error(f"[Req {request_id}] Failed to parse JSON response: {str(e)}")
-                        logger.error(f"[Req {request_id}] Response text: {response.text[:1000]}...")
-                        return None
-                    
-                except httpx.RequestError as e:
-                    logger.error(f"[Req {request_id}] Request failed: {str(e)}")
-                    return None
-                
-        except Exception as e:
-            logger.error(f"[Req {request_id}] Unexpected error in API request: {str(e)}", exc_info=True)
-            
-        return None
-
-    def _merge_classification_results(self, all_results: Dict[str, List[str]], new_results: Dict[str, List[str]]):
-        """Merge new classification results into the accumulated results with deduplication"""
-        if not new_results:
-            return
-            
-        for category, items in new_results.items():
-            if category not in all_results:
-                all_results[category] = []
-                
-            # Add items that aren't already in the results
-            existing_items = set(all_results[category])
-            for item in items:
-                # Simple exact match check first
-                if item not in existing_items:
-                    # More thorough check for similar items
-                    is_duplicate = False
-                    for existing in existing_items:
-                        if self._is_similar_news(item, existing):
-                            is_duplicate = True
-                            break
-                    if not is_duplicate:
-                        all_results[category].append(item)
-                        existing_items.add(item)
-    
-    def _is_similar_news(self, text1: str, text2: str, threshold: float = 0.8) -> bool:
-        """Check if two news items are similar using simple text comparison"""
-        # Simple implementation - can be enhanced with more sophisticated similarity measures
-        # like Jaccard similarity, Levenshtein distance, or embeddings
-        text1 = text1.lower().strip()
-        text2 = text2.lower().strip()
-        
-        # Exact match
-        if text1 == text2:
-            return True
-            
-        # Check if one is a substring of the other (with some leeway)
-        if len(text1) > 10 and len(text2) > 10:  # Only if both are reasonably long
-            if text1 in text2 or text2 in text1:
-                return True
-                
-        # Check for high word overlap (simple implementation)
-        words1 = set(text1.split())
-        words2 = set(text2.split())
-        if not words1 or not words2:
-            return False
-            
-        intersection = words1.intersection(words2)
-        union = words1.union(words2)
-        similarity = len(intersection) / len(union) if union else 0
-        
-        return similarity >= threshold
-
-    def _build_classification_prompt(self, headlines: List[str]) -> str:
-        """Build the prompt for the LLM to classify headlines
-        
-        Args:
-            headlines: List of news headlines to classify
-            
-        Returns:
-            Formatted prompt string for classification
-        """
-        headlines_text = "\n".join([f"- {h}" for h in headlines])
-        
-        return f"""You are an AI/ML news classification expert. Your task is to analyze and classify each news headline into exactly one of the following categories:
-
-## CATEGORIES (MUST USE THESE EXACT NAMES):
-
-🚀 New Services/Launches: New AI products, services, or platforms being launched
-🛠️ Updates/Policy Changes: Technical updates, API changes, or policy updates
-📊 Investment/Business: Funding, acquisitions, partnerships with technical implications
-⚙️ Infrastructure/Dev Tools: Technical tools, libraries, or infrastructure updates
-📈 Technology Trends (Auto): Technical innovations or research findings
-📰 Other News: Only use this if the headline doesn't fit any other category
-
-## INSTRUCTIONS:
-1. Classify EACH headline into ONE of the categories above.
-2. Use the EXACT category names as provided above.
-3. If uncertain, use "📰 Other News" only if the headline truly doesn't fit other categories.
-4. Group similar headlines about the same topic together.
-5. Return ONLY valid JSON with no additional text.
-
-## OUTPUT FORMAT (JSON):
-{{
-    "🚀 New Services/Launches": ["headline 1", "headline 2", ...],
-    "🛠️ Updates/Policy Changes": ["headline 3", ...],
-    "📊 Investment/Business": [],
-    "⚙️ Infrastructure/Dev Tools": [],
-    "📈 Technology Trends (Auto)": [],
-    "📰 Other News": []
-}}
-
-## HEADLINES TO CLASSIFY:
-{headlines_text}"""
-
-    def _build_summary_prompt(self, category: str, headlines: List[str]) -> str:
-        """Build the prompt for the LLM to summarize headlines in a specific category
-        
-        Args:
-            category: The category these headlines belong to
-            headlines: List of news headlines to summarize
-            
-        Returns:
-            Formatted prompt string for summarization
-        """
-        headlines_text = "\n".join([f"- {h}" for h in headlines])
-        
-        return f"""You are an AI/ML technical analyst. Your task is to write concise, insightful summaries in Korean for the following news headlines in the category: {category}
-
-## INSTRUCTIONS:
-1. Write 1-2 sentence summaries in Korean for each headline.
-2. Focus on the key technical or business implications.
-3. Be concise but informative.
-4. Return ONLY valid JSON with no additional text.
-
-## OUTPUT FORMAT (JSON):
-{{
-    "{category}": [
-        "요약 1",
-        "요약 2",
-        ...
-    ]
-}}
-
-## HEADLINES TO SUMMARIZE:
-{headlines_text}"""
-
-    def _extract_json_from_markdown(self, content: str) -> str:
-        """Extract JSON content from markdown code block"""
-        # Check if content is wrapped in markdown code block
-        code_block_start = content.find('```')
-        if code_block_start != -1:
-            # Find the start of the actual JSON (after the first ```)
-            json_start = content.find('{', code_block_start)
-            if json_start == -1:
-                # If no { after ```, try to find any JSON-like content
-                json_start = code_block_start + 3  # Skip the ```
-            
-            # Find the end of the code block
-            code_block_end = content.find('```', code_block_start + 3)
-            if code_block_end == -1:
-                # If no closing ```, take everything after the first ```
-                return content[json_start:].strip()
+            # 1. 마크다운 코드 블록에서 JSON 추출 (더 강력한 패턴)
+            json_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', text, re.DOTALL | re.IGNORECASE)
+            if json_match:
+                json_text = json_match.group(1).strip()
+                logger.info(f"코드 블록에서 JSON 추출 성공 (ID: {request_id})")
             else:
-                return content[json_start:code_block_end].strip()
+                # 2. 중괄호로 시작하는 첫 번째 JSON 객체 찾기
+                brace_match = re.search(r'\{[\s\S]*\}', text, re.DOTALL)
+                if brace_match:
+                    json_text = brace_match.group(0).strip()
+                    logger.info(f"중괄호 패턴으로 JSON 추출 성공 (ID: {request_id})")
+                else:
+                    # 3. 전체 텍스트를 JSON으로 시도
+                    json_text = text.strip()
+                    logger.info(f"전체 텍스트를 JSON으로 시도 (ID: {request_id})")
+
+            # 4. JSON 형식 수정
+            json_text = self._fix_json_format(json_text)
+
+            # 5. 첫 번째 파싱 시도
+            try:
+                result = json.loads(json_text)
+                logger.info(f"JSON 파싱 성공 (ID: {request_id})")
+                return result
+            except json.JSONDecodeError as e:
+                logger.warning(f"첫 번째 JSON 파싱 실패 (ID: {request_id}): {e}")
+
+                # 6. 부분적 JSON 파싱 시도
+                return self._parse_partial_json(json_text, request_id)
+
+        except Exception as e:
+            logger.error(f"JSON 파싱 중 예상치 못한 오류 (ID: {request_id}): {e}")
+
+            # 디버깅용 원본 응답 저장
+            with open(f"parse_error_{request_id}.txt", "w", encoding="utf-8") as f:
+                f.write(f"Original text:\n{text}\n\n")
+                f.write(f"Error: {e}")
+
+            return None
+
+    def _fix_json_format(self, json_text: str) -> str:
+        """JSON 형식 자동 수정 - 개선된 버전"""
+        if not json_text:
+            return json_text
+
+        # 기본 정리
+        json_text = json_text.strip()
+
+        # JSON이 아닌 텍스트가 앞에 있는 경우 제거
+        if not json_text.startswith('{') and not json_text.startswith('['):
+            # 첫 번째 { 또는 [ 찾기
+            start_pos = -1
+            for i, char in enumerate(json_text):
+                if char in '{[':
+                    start_pos = i
+                    break
+
+            if start_pos != -1:
+                json_text = json_text[start_pos:]
+                logger.info("JSON 시작 부분 추출 완료")
+
+        # JSON이 아닌 텍스트가 뒤에 있는 경우 제거
+        if json_text.startswith('{'):
+            # 마지막 }까지만 추출
+            brace_count = 0
+            last_valid_pos = -1
+
+            for i, char in enumerate(json_text):
+                if char == '{':
+                    brace_count += 1
+                elif char == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        last_valid_pos = i + 1
+                        break
+
+            if last_valid_pos > 0:
+                json_text = json_text[:last_valid_pos]
+                logger.info("JSON 끝 부분 추출 완료")
+
+        # 불완전한 중괄호/대괄호 수정
+        open_braces = json_text.count('{')
+        close_braces = json_text.count('}')
+        open_brackets = json_text.count('[')
+        close_brackets = json_text.count(']')
+
+        # 누락된 닫기 괄호 추가
+        if open_braces > close_braces:
+            json_text += '}' * (open_braces - close_braces)
+            logger.info(f"누락된 중괄호 {open_braces - close_braces}개 추가")
+
+        if open_brackets > close_brackets:
+            json_text += ']' * (open_brackets - close_brackets)
+            logger.info(f"누락된 대괄호 {open_brackets - close_brackets}개 추가")
+
+        # 잘못된 쉼표 수정 (마지막 요소 뒤의 쉼표)
+        json_text = re.sub(r',(\s*[}\]])', r'\1', json_text)
+
+        # 누락된 쉼표 추가 (간단한 경우만)
+        json_text = re.sub(r'}\s*{', r'},{', json_text)
+        json_text = re.sub(r']\s*\[', r'],[', json_text)
+
+        # 잘못된 따옴표 수정
+        json_text = re.sub(r'([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1"\2":', json_text)
+
+        # 줄바꿈 문자가 문자열 안에 있는 경우 처리
+        json_text = re.sub(r'("title":\s*"[^"]*)\n([^"]*")', r'\1 \2', json_text)
+
+        return json_text
+
+    def _parse_partial_json(self, json_text: str, request_id: str) -> Optional[Dict]:
+        """부분적 JSON 파싱 시도 - 개선된 버전"""
+        try:
+            # JSON의 기본 구조 확인
+            if not json_text.strip().startswith('{'):
+                logger.error(f"유효한 JSON 구조가 아님 (ID: {request_id})")
+                return None
+
+            # 줄 단위로 점진적 파싱 시도
+            lines = json_text.split('\n')
+
+            # 더 작은 단위부터 시작 (5줄씩)
+            for chunk_size in [5, 10, 15, 20]:
+                if len(lines) < chunk_size:
+                    continue
+
+                for i in range(chunk_size, len(lines) + 1, chunk_size):
+                    partial_json = '\n'.join(lines[:i])
+
+                    # 기본 구조 유지
+                    if not partial_json.strip().startswith('{'):
+                        continue
+
+                    # # 중괄호/대괄호 균형 맞추기
+                    # balanced_json = self._balance_brackets(partial_json)
+                    # 
+                    # # 마지막 불완전한 항목 제거
+                    # balanced_json = self._remove_incomplete_items(balanced_json)
+
+                    try:
+                        result = json.loads(partial_json)
+                        logger.info(f"부분적 JSON 파싱 성공 (ID: {request_id}): {i}/{len(lines)} 라인")
+
+                        # 빈 결과가 아닌지 확인
+                        if isinstance(result, dict) and any(result.values()):
+                            return result
+
+                    except json.JSONDecodeError:
+                        continue
+
+            logger.error(f"모든 부분적 파싱 시도 실패 (ID: {request_id})")
+            return None
+
+        except Exception as e:
+            logger.error(f"부분적 JSON 파싱 중 오류 (ID: {request_id}): {e}")
+            return None
+
+    def classify_news_batch(self, news_titles: List[str]) -> Dict[str, List[Dict]]:
+        """뉴스 배치 분류"""
+        if not news_titles:
+            return {}
+
+        titles_text = "\n".join([f"{i + 1}. {title}" for i, title in enumerate(news_titles)])
+
+        prompt = f"""다음 AI 뉴스 헤드라인들을 6개 카테고리로 분류해주세요:
+
+    {titles_text}
+
+    카테고리:
+    1. new_services - 새로운 AI 서비스, 제품 출시, 모델 릴리즈
+    2. updates - 기존 서비스 업데이트, 정책 변경, 기능 개선
+    3. investment - 투자, 인수합병, 비즈니스 파트너십, 기업 소식
+    4. infrastructure - AI 인프라, 개발 도구, 플랫폼, 하드웨어
+    5. trends - AI 기술 트렌드, 연구 결과, 업계 동향, 분석 보고서
+    6. other - 위 카테고리에 속하지 않는 기타 AI 관련 뉴스
+
+    중요: 반드시 아래 정확한 JSON 형식으로만 응답하세요. 다른 텍스트는 포함하지 마세요.
+
+    {{
+      "new_services": [
+        {{"index": 1, "title": "뉴스 제목"}}
+      ],
+      "updates": [],
+      "investment": [],
+      "infrastructure": [],
+      "trends": [],
+      "other": []
+    }}"""
+
+        messages = [{"role": "user", "content": prompt}]
+
+        response = self._make_api_request(messages, temperature=0.3)  # temperature 낮춤
+        if not response:
+            return {}
+
+        content = response.get('choices', [{}])[0].get('message', {}).get('content', '')
+        request_id = str(uuid.uuid4())[:8]
+
+        parsed_result = self._parse_json_response(content, request_id)
+        if not parsed_result:
+            return {}
+
+        # 결과 정리 및 검증
+        classified = {}
+        for category in self.categories.keys():
+            classified[category] = []
+            if category in parsed_result:
+                for item in parsed_result[category]:
+                    if isinstance(item, dict) and 'index' in item and 'title' in item:
+                        index = item['index'] - 1  # 0-based index로 변환
+                        if 0 <= index < len(news_titles):
+                            classified[category].append({
+                                'index': index,
+                                'title': news_titles[index]
+                            })
+
+        logger.info(f"분류 완료: {len(news_titles)}개 뉴스")
+        return classified
+
+    def generate_summary(self, category: str, news_items: List[Dict]) -> str:
+        """카테고리별 통합 요약 생성 - 개발자 관점의 인사이트 제공"""
+        if not news_items:
+            return ""
+
+        titles_text = "\n".join([f"- {item['title']}" for item in news_items])
+        category_name = self.categories.get(category, category)
+
+        # 카테고리별 맞춤 프롬프트
+        category_prompts = {
+            "new_services": "새로 출시된 AI 서비스나 모델의 기능, 개발자가 어떻게 활용하거나 새로운 제품/서비스로 확장할 수 있을지 중심으로",
+            "updates": "기존 서비스의 업데이트나 정책 변경이 개발 워크플로우, 도구 선택, 협업 방식에 어떤 영향을 미칠지 중심으로",
+            "investment": "투자나 인수합병이 AI 생태계, 개발자 도구 또는 커뮤니티 활동에 어떤 기회나 리스크를 제공하는지 중심으로",
+            "infrastructure": "새로운 인프라/도구의 기술적 특징과 이를 도입할 때 개발자가 고려해야 할 실질적 요소 중심으로",
+            "trends": "기술 트렌드가 개발자의 미래 역량, 학습 방향, 커리어 설계에 어떤 시사점을 주는지 중심으로",
+            "other": "AI 산업 전반 또는 문화적 현상이 개발자에게 어떤 간접적 영향이나 통찰을 줄 수 있는지 중심으로"
+        }
+
+        focus_area = category_prompts.get(category, category_prompts["other"])
+
+        prompt = f"""당신은 AI 개발 동향을 분석하는 전문 애널리스트입니다.
+    다음은 [{category_name}] 카테고리에 포함된 AI 뉴스 헤드라인 목록입니다:
+
+    {titles_text}
+
+    요구사항:
+    1. 반드시 한국어로 작성
+    2. 2~3문장 이내로 간결하게 작성하되, 단순 요약이 아니라 **개발자 관점의 핵심 인사이트**를 도출할 것
+    3. {focus_area}
+    4. 개별 뉴스 제목 언급 없이, 공통된 흐름, 기술적 맥락, 시사점 중심으로 설명
+    5. 추상적 표현보다는 실제 개발자 행동/결정에 도움이 되는 문장으로 작성
+
+    요약 시작:"""
+
+        messages = [{"role": "user", "content": prompt}]
+
+        response = self._make_api_request(messages, temperature=0.1)
+        if not response:
+            return f"{category_name} 관련 {len(news_items)}건의 뉴스입니다."
+
+        content = response.get('choices', [{}])[0].get('message', {}).get('content', '')
         return content.strip()
 
-    def _parse_classification_response(self, content: str) -> Dict[str, List[str]]:
-        """Parse the classification response from the API"""
-        result = {category: [] for category in CATEGORY_MAPPING.keys()}
-        
-        if not content or not content.strip():
-            logger.error("Empty response content received from API")
-            return result
-            
-        logger.debug(f"Raw classification response: {content[:500]}")
-        
-        try:
-            # First, try to parse the content as is
-            try:
-                parsed = json.loads(content)
-            except json.JSONDecodeError:
-                # If direct parsing fails, try to extract JSON from markdown
-                logger.info("Direct JSON parsing failed, trying to extract from markdown...")
-                json_content = self._extract_json_from_markdown(content)
-                parsed = json.loads(json_content)
-            
-            logger.debug(f"Successfully parsed JSON: {json.dumps(parsed, ensure_ascii=False, indent=2)[:500]}")
-            
-            # Handle the parsed data
-            if not isinstance(parsed, dict):
-                logger.error(f"Expected a dictionary but got: {type(parsed).__name__}")
-                return result
-                
-            for category, items in parsed.items():
-                # Normalize category name
-                normalized_category = category.strip()
-                
-                # Ensure the category exists in our mapping
-                if normalized_category not in result:
-                    logger.warning(f"Unexpected category in response: {normalized_category}")
-                    continue
-                    
-                if not isinstance(items, list):
-                    logger.warning(f"Expected list of items for category {normalized_category}, got {type(items).__name__}")
-                    continue
-                    
-                # Clean and add each item
-                for item in items:
-                    if isinstance(item, str) and item.strip():
-                        result[normalized_category].append(item.strip())
-                    else:
-                        logger.warning(f"Skipping invalid item in category {normalized_category}: {item}")
-            
-            # Log the number of items in each category for debugging
-            for category, items in result.items():
-                if items:
-                    logger.debug(f"Category {category} has {len(items)} items")
-            
-            return result
-            
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse classification response: {e}")
-            logger.error(f"Response content (first 1000 chars): {content[:1000]}")
-            
-            # Save the problematic response for debugging
-            with open('failed_parse_response.txt', 'w', encoding='utf-8') as f:
-                f.write(content)
-            
-            # Try to find where the JSON might be malformed
-            try:
-                # Try to find the start of JSON content
-                start_idx = content.find('{')
-                if start_idx > 0:
-                    logger.warning(f"Found JSON starting at position {start_idx}")
-                    logger.warning(f"Content before JSON: {content[:start_idx]}")
-                    # Try to parse from the first {
-                    json_content = content[start_idx:]
-                    # Try to find the end of JSON object
-                    brace_count = 0
-                    in_string = False
-                    escape = False
-                    
-                    for i, char in enumerate(json_content):
-                        if char == '"' and not escape:
-                            in_string = not in_string
-                        elif char == '\\' and in_string:
-                            escape = not escape
-                            continue
-                        elif char == '{' and not in_string:
-                            brace_count += 1
-                        elif char == '}' and not in_string:
-                            brace_count -= 1
-                            if brace_count == 0:
-                                json_content = json_content[:i+1]
-                                break
-                        escape = False
-                    
-                    logger.info(f"Extracted JSON content: {json_content[:100]}...")
-                    parsed = json.loads(json_content)
-                    logger.info("Successfully parsed JSON after extraction")
-                    return self._parse_classification_response(json_content)
-            except Exception as inner_e:
-                logger.error("Failed to fix JSON content", exc_info=True)
-                
-        except Exception as e:
-            logger.error(f"Unexpected error parsing classification response: {e}", exc_info=True)
-            
-        return result
-    
-    def _parse_summary_response(self, expected_category: str, content: str) -> Dict[str, List[str]]:
-        """Parse the summary response from the API for a specific category"""
-        result = {expected_category: []}
-        
-        try:
-            # Try to parse the JSON response
-            parsed = json.loads(content)
-            
-            # Get the summaries for the expected category
-            if expected_category in parsed and isinstance(parsed[expected_category], list):
-                for item in parsed[expected_category]:
-                    if isinstance(item, str) and item.strip():
-                        result[expected_category].append(item.strip())
-            
-            return result
-            
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse summary response: {e}")
-            logger.debug(f"Response content: {content[:500]}...")
-        except Exception as e:
-            logger.error(f"Error parsing summary response: {e}", exc_info=True)
-            
-        return {}
-    
-    def _fix_encoding(self, data):
-        """Helper function to fix encoding issues in the response"""
-        if isinstance(data, str):
-            try:
-                return data.encode('latin1').decode('utf-8')
-            except (UnicodeEncodeError, UnicodeDecodeError):
-                return data
-        elif isinstance(data, list):
-            return [self._fix_encoding(item) for item in data]
-        elif isinstance(data, dict):
-            return {self._fix_encoding(k): self._fix_encoding(v) for k, v in data.items()}
-        return data
+    def check_duplicates_batch(self, news_batch: List[Dict], existing_news: List[Dict] = None) -> List[int]:
+        """LLM 기반 중복 뉴스 검사 - 수정된 버전"""
+        if len(news_batch) <= 1:
+            return []
+
+        current_titles = [news['title'] for news in news_batch]
+        existing_titles = [news['title'] for news in (existing_news or [])]
+
+        all_titles = current_titles + existing_titles
+        titles_text = "\n".join([f"{i + 1}. {title}" for i, title in enumerate(all_titles)])
+
+        logger.info(f"중복 검사 시작: 오늘 뉴스 {len(current_titles)}개, 기존 뉴스 {len(existing_titles)}개")
+
+        prompt = f"""다음 AI 뉴스 헤드라인들 중에서 같은 뉴스 이벤트를 다루는 중복된 뉴스를 찾아주세요:
+
+    {titles_text}
+
+    기준:
+    - 같은 회사의 같은 제품/서비스/사건을 다루는 경우
+    - 단순히 키워드가 비슷한 것이 아닌, 실제로 같은 뉴스 이벤트인 경우
+    - 1번부터 {len(current_titles)}번까지는 오늘 뉴스
+    - {len(current_titles) + 1}번부터 {len(all_titles)}번까지는 기존 뉴스
+
+    중요: duplicates 배열에는 오늘 뉴스(1-{len(current_titles)}) 인덱스만 포함해주세요.
+
+    JSON 형식으로만 응답해주세요:
+    {{
+      "duplicates": [
+        {{
+          "primary": 1,
+          "duplicates": [3, 5]
+        }}
+      ]
+    }}
+
+    중복이 없으면:
+    {{
+      "duplicates": []
+    }}"""
+
+        messages = [{"role": "user", "content": prompt}]
+
+        response = self._make_api_request(messages, temperature=0.1)
+        if not response:
+            return []
+
+        content = response.get('choices', [{}])[0].get('message', {}).get('content', '')
+        request_id = str(uuid.uuid4())[:8]
+
+        parsed_result = self._parse_json_response(content, request_id)
+        if not parsed_result or 'duplicates' not in parsed_result:
+            logger.warning(f"중복 검사 결과 파싱 실패 (ID: {request_id})")
+            return []
+
+        # 오늘 뉴스 중에서 중복된 것들의 인덱스 추출
+        duplicate_indices = []
+
+        for dup_group in parsed_result['duplicates']:
+            if not isinstance(dup_group, dict):
+                continue
+
+            # primary 인덱스 처리
+            primary = dup_group.get('primary')
+            if isinstance(primary, int) and 1 <= primary <= len(current_titles):
+                # primary가 오늘 뉴스 범위에 있으면 중복으로 표시하지 않음 (기준점이므로)
+                pass
+
+            # duplicates 배열 처리
+            duplicates_list = dup_group.get('duplicates', [])
+            if not isinstance(duplicates_list, list):
+                continue
+
+            for idx in duplicates_list:
+                if isinstance(idx, int):
+                    # 오늘 뉴스 범위 내의 인덱스만 처리
+                    if 1 <= idx <= len(current_titles):
+                        duplicate_indices.append(idx - 1)  # 0-based index로 변환
+                        logger.debug(f"오늘 뉴스 중복 발견: {idx} -> {current_titles[idx - 1]}")
+                    elif idx > len(current_titles):
+                        # 기존 뉴스와의 중복인 경우, primary가 오늘 뉴스라면 해당 primary를 중복으로 표시
+                        if isinstance(primary, int) and 1 <= primary <= len(current_titles):
+                            if primary - 1 not in duplicate_indices:  # 중복 추가 방지
+                                duplicate_indices.append(primary - 1)
+                                logger.debug(f"기존 뉴스와 중복: {primary} -> {current_titles[primary - 1]}")
+
+        # 중복 제거 및 정렬
+        duplicate_indices = sorted(list(set(duplicate_indices)))
+
+        logger.info(f"LLM 중복 검사 완료: {len(duplicate_indices)}개 중복 발견")
+
+        # 디버깅용 로그
+        for idx in duplicate_indices[:5]:  # 최대 5개만 로그
+            if idx < len(current_titles):
+                logger.debug(f"중복 뉴스: {current_titles[idx]}")
+
+        return duplicate_indices
 
 
 class NewsProcessor:
-    def __init__(self, supabase_client, classifier: NewsClassifier):
-        self.supabase = supabase_client
+    """전체 뉴스 처리 로직을 관리하는 메인 클래스"""
+
+    def __init__(self, supabase: Client, classifier: NewsClassifier):
+        self.supabase = supabase
         self.classifier = classifier
-        # Set timezone to KST (UTC+9)
+        self.batch_size = 50
+        self.duplicate_threshold = 0.8
         self.kst = timezone(timedelta(hours=9))
-        self.today = datetime.now(self.kst).date()
-        self.section_titles = {
-            "new_services": "🚀 New AI Services & Launches",
-            "updates_policy": "🛠️ AI Updates & Policy Changes",
-            "investment_business": "📊 AI Investments & Business",
-            "infrastructure": "⚙️ AI Infrastructure & Dev Tools",
-            "tech_trends": "📈 AI Technology Trends",
-            "other_news": "📰 Other AI News"
-        }
 
-    async def process_news(self):
-        """Main method to process news"""
-        logger.info("Starting news processing...")
-        
-        # Get today's news
-        news_items = self._get_todays_news()
-        if not news_items:
-            logger.info("No news found for today.")
-            return
-            
-        logger.info(f"Found {len(news_items)} news items for today.")
-        
-        # Filter out duplicates
-        unique_news = await self._find_duplicates(news_items)
-        if not unique_news:
-            logger.info("No unique news items to process after duplicate removal.")
-            return
-            
-        logger.info(f"Processing {len(unique_news)} unique news items.")
-        
-        # Extract headlines
-        headlines = [item['title'] for item in unique_news]
-        
-        # Process headlines to get both classification and summary
-        result = await self.classifier.process_headlines(headlines)
-        
-        # Save to database and mark as processed
-        await self._save_classification(result, unique_news)
-        
-        logger.info("News processing completed successfully.")
-    
-    def _clean_title(self, title: str) -> str:
-        """Clean title by replacing single quotes with similar-looking special characters
-        
-        Args:
-            title: The title to clean
-            
-        Returns:
-            str: Cleaned title with single quotes replaced
-        """
-        if not title:
-            return title
-            
-        # Replace single quotes with similar-looking special characters
-        # Left single quote with '`' (backtick)
-        # Right single quote with '\u2019' (right single quotation mark)
-        # Single quote in the middle of a word with '\u02BC' (modifier letter apostrophe)
-        cleaned = title.replace("'", "\u2019")  # Replace all single quotes with right single quotation mark
-        
-        # Handle cases where single quotes are used as apostrophes in the middle of words
-        cleaned = cleaned.replace("\u2019s ", "\u02BCs ")  # 's -> ʼs
-        cleaned = cleaned.replace("\u2019t ", "\u02BCt ")  # 't -> ʼt
-        cleaned = cleaned.replace("\u2019re ", "\u02BCre ") # 're -> ʼre
-        cleaned = cleaned.replace("\u2019ve ", "\u02BCve ") # 've -> ʼve
-        cleaned = cleaned.replace("\u2019ll ", "\u02BCll ") # 'll -> ʼll
-        cleaned = cleaned.replace("\u2019d ", "\u02BCd ")   # 'd -> ʼd
-        cleaned = cleaned.replace("\u2019m ", "\u02BCm ")   # 'm -> ʼm
-        
-        # Handle leading single quotes (like in contractions or quotes at the beginning)
-        if cleaned.startswith("\u2019"):
-            cleaned = "`" + cleaned[1:]
-            
-        return cleaned
+    def get_todays_news(self) -> List[Dict]:
+        """오늘자 뉴스 데이터 수집"""
+        # 현재 KST 날짜 계산
+        now_kst = datetime.now(self.kst) - timedelta(days=1)
+        today_start_kst = now_kst.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_end_kst = now_kst.replace(hour=23, minute=59, second=59, microsecond=999999)
 
-    def _get_todays_news(self) -> List[Dict[str, Any]]:
-        """Fetch today's news from the database
-        
-        Returns:
-            List of news items from today that haven't been marked as duplicates
-            
-        Note:
-            Date range is set to KST 00:00:00 to 23:59:59.999 of the current day
-            which translates to UTC 15:00:00 (previous day) to 14:59:59.999 (current day)
-        """
+        # UTC로 변환
+        today_start_utc = today_start_kst.astimezone(timezone.utc)
+        today_end_utc = today_end_kst.astimezone(timezone.utc)
+
+        logger.info(f"오늘자 뉴스 조회: {today_start_kst} ~ {today_end_kst} (KST)")
+
         try:
-            # Get current date in KST
-            kst = timezone(timedelta(hours=9))
-            utc = timezone.utc
-            
-            # Get current date components in KST
-            kst_now = datetime.now(kst)
-            year = kst_now.year
-            month = kst_now.month
-            day = kst_now.day
-            
-            # Calculate UTC time range that corresponds to KST 00:00:00 - 23:59:59.999
-            # KST 00:00:00 = UTC 15:00:00 (previous day)
-            utc_start = datetime(year, month, day - 1, 15, 0, 0, 0, tzinfo=utc)
-            # KST 23:59:59.999 = UTC 14:59:59.999 (current day)
-            utc_end = datetime(year, month, day, 14, 59, 59, 999000, tzinfo=utc)
-            
-            logger.info(f"Fetching news from {utc_start} to {utc_end}")
-            
-            # Query Supabase with UTC time range
             response = self.supabase.table('ai_news') \
                 .select('*') \
-                .gte('pub_date', utc_start.isoformat()) \
-                .lte('pub_date', utc_end.isoformat()) \
-                .order('pub_date', desc=True) \
-                .limit(20) \
+                .gte('pub_date', today_start_utc.isoformat()) \
+                .lte('pub_date', today_end_utc.isoformat()) \
                 .execute()
-                
-            if not response.data:
-                logger.warning("No news items found in the database for the specified time range.")
-                return []
-                
-            logger.info(f"Found {len(response.data)} news items in the database.")
-            
-            # Clean titles before returning
-            for item in response.data:
-                if 'title' in item and item['title']:
-                    item['title'] = self._clean_title(item['title'])
-                    
-            return response.data
-            
+
+            news_list = response.data
+            logger.info(f"조회된 뉴스 개수: {len(news_list)}")
+
+            # 제목의 특수문자 정리
+            for news in news_list:
+                if news.get('title'):
+                    news['title'] = re.sub(r'[""''`]', '"', news['title'])
+                    news['title'] = news['title'].strip()
+
+            return news_list
+
         except Exception as e:
-            logger.error(f"Error fetching today's news: {str(e)}")
+            logger.error(f"뉴스 조회 실패: {e}")
             return []
-            
-    def _simple_similarity(self, title1: str, title2: str) -> bool:
-        """Check if two titles are similar using simple text matching
-        
-        Args:
-            title1: First title to compare
-            title2: Second title to compare
-            
-        Returns:
-            bool: True if titles are considered similar
-        """
-        from difflib import SequenceMatcher
-        
-        # Remove common words that don't affect meaning
-        common_words = {'the', 'a', 'an', 'in', 'on', 'at', 'to', 'for', 'of', 'and', 'or', 'but',
-                      '은', '는', '이', '가', '을', '를', '에', '에서', '으로', '로', '의', '과', '와', '도', '만', '까지'}
-        
-        # Simple case: if one title is contained in another
-        if title1 in title2 or title2 in title1:
-            return True
-            
-        # Check sequence similarity
-        similarity = SequenceMatcher(None, title1, title2).ratio()
-        return similarity >= 0.9
 
-    async def _find_duplicates_with_llm(self, current_batch: List[Dict[str, Any]], 
-                                     previous_uniques: List[Dict[str, Any]] = None) -> tuple[list[Dict[str, Any]], list[str]]:
-        """Use LLM to find duplicate news items in a batch, considering previous unique items
-        
-        Args:
-            current_batch: List of news items in current batch
-            previous_uniques: List of previously identified unique items to check against
-            
-        Returns:
-            tuple: (list of unique news items, list of duplicate news IDs)
-        """
-        if not current_batch:
-            return [], []
-            
-        # Combine current batch with previous uniques for comparison
-        all_items = (previous_uniques or []) + current_batch
-        
-        # If we have too many items, split into chunks that fit within token limits
-        max_items_per_batch = 20  # Adjust based on token limits
-        
-        unique_items = {}
-        duplicate_ids = set()
-        
-        # Process in chunks to avoid token limits
-        for i in range(0, len(all_items), max_items_per_batch):
-            chunk = all_items[i:i + max_items_per_batch]
-            
-            # Prepare the prompt for the LLM
-            prompt = """
-            You are a news analysis expert. Your task is to identify duplicate news articles from the following list.
-            Articles are considered duplicates if they report the same news story, even if the wording is different.
-            
-            Instructions:
-            1. Group the articles by the news story they report on.
-            2. For each group, keep the most informative/complete version (prioritize items with more details).
-            3. If an article is a duplicate of one in a previous batch, mark it as duplicate.
-            4. Return a JSON object with the following structure:
-            {
-                "groups": [
-                    {
-                        "primary_id": "id_of_article_to_keep",
-                        "duplicate_ids": ["id1", "id2", ...]
-                    },
-                    ...
-                ]
-            }
-            
-            Articles to analyze:
-            """
-            
-            # Add articles to the prompt with metadata
-            for item in chunk:
-                prompt += f"\nID: {item['id']}\n"
-                prompt += f"Title: {item['title']}\n"
-                if 'description' in item:
-                    prompt += f"Description: {item['description'][:200]}...\n"
-                prompt += f"Source: {item.get('source', 'N/A')}\n"
-            try:
-                async with httpx.AsyncClient(timeout=120.0) as client:
-                    response = await client.post(
-                        TOGETHER_API_URL,
-                        headers={
-                            "Authorization": f"Bearer {TOGETHER_API_KEY}",
-                            "Content-Type": "application/json"
-                        },
-                        json={
-                            "model": MODEL_NAME,
-                            "messages": [{"role": "user", "content": prompt}],
-                            "temperature": 0.1,
-                            "max_tokens": 4000
-                        }
-                    )
-                    response.raise_for_status()
-                    result = response.json()
-                    content = result['choices'][0]['message']['content']
-
-                    # Clean up the response to handle markdown code blocks and extract JSON
-                    content = content.strip()
-                    
-                    # Try to find JSON in markdown code blocks first
-                    json_match = re.search(r'```(?:json)?\s*({[\s\S]*?})\s*```', content, re.DOTALL)
-                    if json_match:
-                        try:
-                            analysis = json.loads(json_match.group(1).strip())
-                        except json.JSONDecodeError:
-                            # If parsing fails, try to find any JSON in the content
-                            json_match = re.search(r'({[\s\S]*})', content, re.DOTALL)
-                            if json_match:
-                                try:
-                                    analysis = json.loads(json_match.group(1).strip())
-                                except json.JSONDecodeError:
-                                    analysis = {'groups': []}
-                            else:
-                                analysis = {'groups': []}
-                    else:
-                        # If no code block, try to find JSON directly in the response
-                        try:
-                            analysis = json.loads(content)
-                        except json.JSONDecodeError:
-                            # Try to find any JSON object in the content
-                            json_match = re.search(r'({[\s\S]*})', content, re.DOTALL)
-                            if json_match:
-                                try:
-                                    analysis = json.loads(json_match.group(1).strip())
-                                except:
-                                    analysis = {'groups': []}
-                            else:
-                                analysis = {'groups': []}
-                    
-                    # Log the extracted analysis for debugging
-                    logger.debug(f"Extracted analysis: {json.dumps(analysis, ensure_ascii=False, indent=2)}")
-                    
-                    # Process the results
-                    if not isinstance(analysis, dict) or 'groups' not in analysis:
-                        logger.warning(f"Unexpected LLM response format: {content}")
-                        analysis = {'groups': []}
-                        
-                    for group in analysis.get('groups', []):
-                        primary_id = str(group.get('primary_id'))
-                        if not primary_id:
-                            continue
-                            
-                        # Find the primary item
-                        primary_item = next((item for item in chunk if str(item['id']) == primary_id), None)
-                        if not primary_item:
-                            continue
-                            
-                        # Add to unique items if not already there
-                        if primary_id not in unique_items:
-                            unique_items[primary_id] = primary_item
-                        
-                        # Mark duplicates
-                        for dup_id in group.get('duplicate_ids', []):
-                            dup_id = str(dup_id)
-                            if dup_id != primary_id:  # Make sure we're not marking the primary as duplicate
-                                duplicate_ids.add(dup_id)
-                                
-                                # If a previously unique item is marked as duplicate, update our records
-                                if dup_id in unique_items:
-                                    del unique_items[dup_id]
-                                    
-            except Exception as e:
-                logger.error(f"Error in LLM batch duplicate detection: {str(e)}")
-                # In case of error, treat all in this chunk as unique
-                for item in chunk:
-                    item_id = str(item['id'])
-                    if item_id not in duplicate_ids:
-                        unique_items[item_id] = item
-        
-        # Filter out any items that were marked as duplicates
-        unique_items = {k: v for k, v in unique_items.items() if k not in duplicate_ids}
-        
-        # Only return items from current batch (not previous uniques)
-        current_batch_ids = {str(item['id']) for item in current_batch}
-        batch_duplicates = [did for did in duplicate_ids if did in current_batch_ids]
-        batch_uniques = [item for item in unique_items.values() 
-                        if str(item['id']) in current_batch_ids]
-        
-        return batch_uniques, batch_duplicates
-
-    async def _find_duplicates(self, news_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Identify and mark duplicate news items using a two-step approach
-        
-        Args:
-            news_items: List of news items to check for duplicates
-            
-        Returns:
-            List of non-duplicate news items ready for processing
-        """
-        if not news_items:
+    def remove_simple_duplicates(self, news_list: List[Dict]) -> List[Dict]:
+        """1단계: 빠른 유사도 검사로 중복 제거"""
+        if not news_list:
             return []
-            
-        logger.info(f"Starting duplicate detection for {len(news_items)} news items")
-        
-        # Sort by publish date (newer first) to keep the most recent version
-        news_items.sort(key=lambda x: x.get('pub_date', ''), reverse=True)
-        
-        # Step 1: Simple similarity check (fast)
+
+        logger.info("1단계 중복 검사 시작 (텍스트 유사도)")
+
         unique_news = []
-        potential_duplicates = []
-        
-        # First pass: check for obvious duplicates using simple similarity
-        for item in news_items:
+        seen_titles = []
+
+        for news in news_list:
+            title = news.get('title', '').strip().lower()
+            if not title:
+                continue
+
             is_duplicate = False
-            
-            for unique_item in unique_news:
-                if self._simple_similarity(item['title'], unique_item['title']):
-                    # Found a duplicate using simple comparison
-                    logger.info(f"Found simple duplicate: '{item['title']}' is similar to '{unique_item['title']}'")
+
+            for seen_title in seen_titles:
+                # 포함 관계 검사
+                if title in seen_title or seen_title in title:
                     is_duplicate = True
                     break
-                    
+
+                # SequenceMatcher 유사도 검사
+                similarity = SequenceMatcher(None, title, seen_title).ratio()
+                if similarity >= 0.9:
+                    is_duplicate = True
+                    break
+
             if not is_duplicate:
-                # If no obvious duplicate found, keep for LLM check
-                potential_duplicates.append(item)
-            
-            # Keep track of unique items for cross-batch comparison
-            if not is_duplicate:
-                unique_news.append(item)
-        
-        logger.info(f"After simple deduplication: {len(unique_news)} unique items, {len(potential_duplicates)} items for LLM check")
-        
-        # Step 2: Use LLM for more sophisticated duplicate detection
-        if len(potential_duplicates) > 1:  # Need at least 2 items to compare
-            # Get previously processed unique items from database for cross-batch comparison
-            try:
-                # Get unique items from the last 24 hours to compare with
-                yesterday = datetime.now(self.kst) - timedelta(days=1)
-                try:
-                    # Try with the correct table name (adjust 'ai_news' to your actual table name)
-                    result = self.supabase.table('ai_news')\
-                        .select('*')\
-                        .eq('is_duplicate', False)\
-                        .gte('pub_date', yesterday.isoformat())\
-                        .order('pub_date', desc=True)\
-                        .execute()
-                    
-                    previous_uniques = result.data if hasattr(result, 'data') else []
-                except Exception as e:
-                    logger.warning(f"Could not fetch previous uniques: {str(e)}")
-                    previous_uniques = []
-                logger.info(f"Found {len(previous_uniques)} previously processed unique items for comparison")
-                
-            except Exception as e:
-                logger.error(f"Error fetching previous unique items: {str(e)}")
-                previous_uniques = []
-            
-            # Process in batches with LLM
-            all_llm_uniques = []
-            all_duplicate_ids = set()
-            
-            for i in range(0, len(potential_duplicates), BATCH_SIZE):
-                batch = potential_duplicates[i:i + BATCH_SIZE]
-                logger.info(f"Processing batch {i//BATCH_SIZE + 1}/{(len(potential_duplicates)-1)//BATCH_SIZE + 1} with {len(batch)} items")
-                
-                # Include previously identified uniques in the comparison
-                llm_uniques, duplicate_ids = await self._find_duplicates_with_llm(
-                    batch, 
-                    previous_uniques + all_llm_uniques
-                )
-                
-                all_llm_uniques.extend(llm_uniques)
-                all_duplicate_ids.update(duplicate_ids)
-            
-            # Mark LLM-identified duplicates
-            if all_duplicate_ids:
-                logger.info(f"LLM identified {len(all_duplicate_ids)} duplicate items")
-                self._mark_as_duplicate(list(all_duplicate_ids))
-            
-            # Update unique items with LLM results
-            unique_news = [item for item in unique_news 
-                         if str(item['id']) not in all_duplicate_ids]
-            unique_news.extend(all_llm_uniques)
-        
-        # Mark all remaining items as processed
-        processed_ids = [item['id'] for item in unique_news]
-        if processed_ids:
-            self._mark_as_processed([{'id': pid} for pid in processed_ids])
-        
-        logger.info(f"Final unique items after deduplication: {len(unique_news)}")
+                unique_news.append(news)
+                seen_titles.append(title)
+
+        removed_count = len(news_list) - len(unique_news)
+        logger.info(f"1단계 중복 제거 완료: {removed_count}개 제거, {len(unique_news)}개 남음")
+
         return unique_news
-        
-    async def _is_similar(self, title1: str, title2: str) -> bool:
-        """Check if two news titles refer to the same news using LLM
-        
-        Args:
-            title1: First title to compare
-            title2: Second title to compare
-            
-        Returns:
-            bool: True if titles are considered to be about the same news
-        """
-        # If titles are exactly the same, return True immediately
-        if title1.strip().lower() == title2.strip().lower():
-            return True
-            
-        # Prepare the prompt for the LLM
-        prompt = f"""
-        You are a news analysis expert. Your task is to determine if two news headlines are about the same news story.
-        
-        Headline 1: "{title1}"
-        Headline 2: "{title2}"
-        
-        Consider the following factors in your analysis:
-        1. Are the main subjects/entities the same?
-        2. Are they reporting the same event or development?
-        3. Are the key details (who, what, when, where, why) consistent?
-        
-        Respond with a JSON object containing:
-        {{
-            "is_same_news": boolean,
-            "reasoning": "Brief explanation of your decision"
-        }}
-        """
-        
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(
-                    TOGETHER_API_URL,
-                    headers={
-                        "Authorization": f"Bearer {TOGETHER_API_KEY}",
-                        "Content-Type": "application/json"
-                    },
-                    json={
-                        "model": MODEL_NAME,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.1,  # Low temperature for more deterministic responses
-                        "max_tokens": 200
-                    }
-                )
-                response.raise_for_status()
-                result = response.json()
-                content = result['choices'][0]['message']['content']
-                
-                # Parse the JSON response
-                import json
-                try:
-                    analysis = json.loads(content)
-                    logger.info(f"LLM analysis for '{title1}' vs '{title2}': {analysis.get('reasoning', 'No reasoning provided')}")
-                    return analysis.get('is_same_news', False)
-                except json.JSONDecodeError:
-                    logger.warning(f"Failed to parse LLM response: {content}")
-                    return False
-                    
-        except Exception as e:
-            logger.error(f"Error in LLM similarity check: {str(e)}")
-            # Fallback to simple similarity check if LLM fails
-            from difflib import SequenceMatcher
-            similarity = SequenceMatcher(None, title1, title2).ratio()
-            return similarity >= 0.85  # Slightly higher threshold for fallback
-            
 
-    
-    async def _save_classification(self, result: Dict[str, Any], news_items: List[Dict[str, Any]]):
-        """Save classified news and summaries to the newsletter_sections table
-        
-        Args:
-            result: Dictionary containing 'classification' and 'summary' keys
-            news_items: List of news items to process
-        """
+    def remove_llm_duplicates(self, news_list: List[Dict]) -> List[Dict]:
+        """2단계: LLM 기반 정교한 중복 검사 - 개선된 버전"""
+        if len(news_list) <= 1:
+            return news_list
+
+        logger.info("2단계 중복 검사 시작 (LLM 기반)")
+
+        # 이전 24시간 뉴스 조회 (최대 100개로 제한)
+        today = datetime.now(self.kst)
+        today_start_utc = today.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+
+        existing_news = []
         try:
-            date_str = self.today.strftime('%Y-%m-%d')
-            logger.info(f"[저장 시작] 날짜: {date_str}, 카테고리 수: {len(result.get('classification', {}))}")
-            
-            # Log input data for debugging
-            logger.debug(f"[분류 결과] {json.dumps(result.get('classification', {}), ensure_ascii=False, indent=2)}")
-            logger.debug(f"[요약 결과] {json.dumps(result.get('summary', {}), ensure_ascii=False, indent=2)}")
-            
-            # Delete existing entries for the date
-            logger.info(f"[기존 데이터 삭제] 날짜: {date_str}")
-            try:
-                delete_result = self.supabase.table('newsletter_sections')\
-                    .delete()\
-                    .eq('publish_date', date_str)\
-                    .execute()
-                logger.info(f"[기존 데이터 삭제 완료] 삭제된 레코드 수: {len(delete_result.data) if hasattr(delete_result, 'data') else '알 수 없음'}")
-            except Exception as e:
-                logger.error(f"[오류] 기존 데이터 삭제 실패: {str(e)}")
-                raise
-            
-            # Create a mapping of (id, title) to news item for more accurate lookup
-            news_key_to_item = {(item['id'], item['title']): item for item in news_items}
-            processed_news_ids = set()  # Track processed news IDs to prevent duplicates
-            
-            # Get classification and summary from result
-            classification = result.get('classification', {})
-            summaries = result.get('summary', {})
-            
-            logger.info(f"[처리 시작] 총 {len(classification)}개 카테고리, {len(news_items)}개 뉴스 항목")
-            
-            # Process each category
-            for category_display, headlines in classification.items():
-                if not headlines:
-                    logger.debug(f"[카테고리 건너뜀] {category_display}: 빈 헤드라인")
-                    continue
-                    
-                category_key = CATEGORY_MAPPING.get(category_display)
-                if not category_key:
-                    logger.warning(f"[경고] 알 수 없는 카테고리: {category_display}")
-                    continue
-                
-                logger.info(f"[카테고리 처리 중] {category_display} ({len(headlines)}개 항목)")
-                
-                # Prepare content for this category
-                section_content = []
-                for idx, headline in enumerate(headlines, 1):
-                    # Find matching news item by both ID and title that hasn't been processed yet
-                    matching_items = [item for (id, title), item in news_key_to_item.items() 
-                                    if title == headline and id not in processed_news_ids]
-                    
-                    if not matching_items:
-                        logger.debug(f"  - [항목 {idx}] 일치하는 뉴스 없음: {headline}")
-                        continue
-                        
-                    # Take the first matching item
-                    news_item = matching_items[0]
-                    try:
-                        # Always use self.today for consistency
-                        pub_date = datetime.combine(self.today, datetime.min.time()).astimezone(self.kst).isoformat()
-                            
-                        item_data = {
-                            'id': news_item['id'],
-                            'title': headline,
-                            'source': news_item.get('source', 'Unknown'),
-                            'url': news_item.get('url', ''),
-                            'published_at': pub_date,
-                        }
-                        section_content.append(item_data)
-                        processed_news_ids.add(news_item['id'])
-                        logger.debug(f"  - [항목 {idx}] 추가됨: {headline}")
-                        
-                    except Exception as e:
-                        logger.error(f"[오류] 항목 처리 실패: {headline}, 오류: {str(e)}")
-                
-                if not section_content:
-                    logger.warning(f"[경고] {category_display}에 저장할 유효한 항목이 없습니다.")
-                    continue
-                
-                logger.info(f"[카테고리 준비 완료] {category_display}: {len(section_content)}개 항목")
-                
-                # Get summary for this category, if available
-                category_summary = summaries.get(category_display, [])
-                summary_text = '\n'.join([f"• {insight}" for insight in category_summary])
-                
-                logger.debug(f"[요약] {category_display}: {summary_text[:100]}...")
-                logger.debug(f"[내용 샘플] {json.dumps(section_content[0], ensure_ascii=False, indent=2) if section_content else '없음'}")
-                
-                # Prepare section data with consistent date
-                section_data = {
-                    'section_name': category_key,
-                    'section_title': self.section_titles.get(category_key, category_key),
-                    'content': section_content,
-                    'summary': summary_text,
-                    'display_order': list(CATEGORY_MAPPING.values()).index(category_key) + 1,  # 1-based index
-                    'publish_date': date_str,  # Use the same date_str for consistency
-                    'is_published': True,
-                    'updated_at': datetime.now(timezone.utc).isoformat()
-                }
-                
-                # Insert the new section
+            existing_response = self.supabase.table('ai_news') \
+                .select('title') \
+                .gte('pub_date', today_start_utc.isoformat()) \
+                .eq('is_processed', True) \
+                .execute()
+            existing_news = existing_response.data
+            logger.info(f"기존 뉴스 조회 완료: {len(existing_news)}개")
+        except Exception as e:
+            logger.error(f"기존 뉴스 조회 실패: {e}")
+            existing_news = []
+
+        duplicate_indices = set()
+
+        # 배치 단위로 중복 검사 (크기 조정)
+        batch_size = min(20, len(news_list))  # 최대 20개
+
+        try:
+            for i in range(0, len(news_list), batch_size):
+                batch = news_list[i:i + batch_size]
+                logger.info(f"배치 중복 검사: {i + 1}-{i + len(batch)}번째 뉴스")
+
                 try:
-                    self.supabase.table('newsletter_sections')\
-                        .insert(section_data)\
+                    batch_duplicates = self.classifier.check_duplicates_batch(batch, existing_news)
+
+                    # 전체 인덱스로 변환 및 검증
+                    for dup_idx in batch_duplicates:
+                        global_idx = i + dup_idx
+                        if 0 <= global_idx < len(news_list):
+                            duplicate_indices.add(global_idx)
+                        else:
+                            logger.warning(f"잘못된 중복 인덱스: {global_idx} (전체 뉴스: {len(news_list)}개)")
+
+                    logger.info(f"배치 중복 검사 완료: {len(batch_duplicates)}개 중복 발견")
+
+                    # API 호출 간격 조정
+                    time.sleep(1)
+
+                except Exception as batch_error:
+                    logger.error(f"배치 {i // batch_size + 1} 중복 검사 실패: {batch_error}")
+                    continue
+
+        except Exception as e:
+            logger.error(f"전체 중복 검사 과정에서 오류: {e}")
+
+        # 중복 플래그 업데이트
+        if duplicate_indices:
+            duplicate_ids = []
+            for idx in duplicate_indices:
+                if 0 <= idx < len(news_list) and 'id' in news_list[idx]:
+                    duplicate_ids.append(news_list[idx]['id'])
+
+            if duplicate_ids:
+                try:
+                    self.supabase.table('ai_news') \
+                        .update({'is_duplicate': True}) \
+                        .in_('id', duplicate_ids) \
                         .execute()
-                    logger.info(f"Inserted new section: {category_key}")
+                    logger.info(f"중복 플래그 업데이트 완료: {len(duplicate_ids)}개")
                 except Exception as e:
-                    logger.error(f"Error inserting section {category_key}: {str(e)}")
-                    raise
-                
-                # Mark news items as processed
-                news_ids = [item['id'] for item in section_content]
-                self._mark_as_processed(news_ids)
-                
-        except Exception as e:
-            logger.error(f"Error saving classification: {str(e)}")
-            raise
-    
-    def _mark_as_duplicate(self, news_ids: List[int]) -> None:
-        """Mark news items as duplicates in the database."""
-        if not news_ids:
-            return
-            
-        try:
-            update_data = {'is_duplicate': True}
-            # Only include updated_at if the column exists
+                    logger.error(f"중복 플래그 업데이트 실패: {e}")
 
-            self.supabase.table('ai_news')\
-                .update(update_data)\
-                .in_('id', news_ids)\
-                .execute()
-            logger.info(f"Marked {len(news_ids)} news items as duplicates")
-        except Exception as e:
-            logger.error(f"Error marking news as duplicates: {str(e)}")
-            raise
-    
-    def _mark_as_processed(self, news_items: Union[List[Dict[str, Any]], List[int]]) -> None:
-        """Mark news items as processed in the database."""
-        if not news_items:
+        # 중복이 아닌 뉴스만 반환
+        unique_news = []
+        for i, news in enumerate(news_list):
+            if i not in duplicate_indices:
+                unique_news.append(news)
+
+        logger.info(f"2단계 중복 제거 완료: {len(duplicate_indices)}개 제거, {len(unique_news)}개 남음")
+
+        # 중복 제거 상세 로그 (최대 10개)
+        removed_count = 0
+        for idx in sorted(duplicate_indices)[:10]:
+            if idx < len(news_list):
+                logger.info(f"중복 제거: {news_list[idx].get('title', 'N/A')}")
+                removed_count += 1
+
+        if len(duplicate_indices) > 10:
+            logger.info(f"... 외 {len(duplicate_indices) - 10}개 더")
+
+        return unique_news
+
+    def classify_and_summarize_news(self, news_list: List[Dict]) -> Dict[str, Dict]:
+        """뉴스 분류 및 요약"""
+        if not news_list:
+            return {}
+
+        logger.info(f"뉴스 분류 시작: {len(news_list)}개")
+
+        # 제목만 추출
+        titles = [news['title'] for news in news_list]
+
+        # 배치 단위로 분류
+        all_classified = {}
+        for category in self.classifier.categories.keys():
+            all_classified[category] = []
+
+        for i in range(0, len(titles), self.batch_size):
+            batch_titles = titles[i:i + self.batch_size]
+            batch_classified = self.classifier.classify_news_batch(batch_titles)
+
+            for category, items in batch_classified.items():
+                for item in items:
+                    # 전체 인덱스로 변환
+                    global_index = i + item['index']
+                    if global_index < len(news_list):
+                        news_item = news_list[global_index].copy()
+                        news_item['title'] = item['title']
+                        all_classified[category].append(news_item)
+
+        # 각 카테고리별 요약 생성
+        results = {}
+        for category, news_items in all_classified.items():
+            if news_items:
+                # 카테고리당 최대 10개씩 청크 단위로 요약
+                summary_chunks = []
+                for i in range(0, len(news_items), 10):
+                    chunk = news_items[i:i + 10]
+                    chunk_summary = self.classifier.generate_summary(category, chunk)
+                    if chunk_summary:
+                        summary_chunks.append(chunk_summary)
+
+                results[category] = {
+                    'items': news_items,
+                    'summary': ' '.join(summary_chunks) if summary_chunks else ''
+                }
+
+                logger.info(f"{self.classifier.categories[category]}: {len(news_items)}개")
+
+        return results
+
+    def save_to_newsletter_sections(self, classified_results: Dict[str, Dict]) -> None:
+        """분류 결과를 데이터베이스에 저장"""
+        if not classified_results:
+            logger.info("저장할 분류 결과가 없습니다.")
             return
-            
+
+        logger.info("뉴스레터 섹션 저장 시작")
+
+        # 오늘 날짜
+        today_kst = datetime.now(self.kst).date()
+
         try:
-            # Handle both list of dicts and list of IDs
-            if isinstance(news_items[0], dict):
-                news_ids = [item['id'] for item in news_items if isinstance(item, dict) and 'id' in item]
-            else:
-                news_ids = [item for item in news_items if isinstance(item, int)]
-                
-            if not news_ids:
+            # 기존 데이터 삭제
+            self.supabase.table('newsletter_sections') \
+                .delete() \
+                .eq('publish_date', today_kst.isoformat()) \
+                .execute()
+
+            # 새로운 섹션 데이터 생성
+            sections_to_insert = []
+            display_order = 1
+
+            for category, data in classified_results.items():
+                if data['items']:
+                    # 뉴스 항목 정보 준비
+                    news_items = []
+                    for news in data['items']:
+                        news_items.append({
+                            'id': news['id'],
+                            'title': news['title'],
+                            'source': news.get('source', ''),
+                            'url': news.get('url', ''),
+                            'pub_date': news.get('pub_date', '')
+                        })
+
+                    section_data = {
+                        'publish_date': today_kst.isoformat(),
+                        'section_name': category,
+                        'section_title': self.classifier.categories[category],
+                        'summary': data['summary'],
+                        'content': news_items,
+                        'display_order': display_order,
+                        'created_at': datetime.now(timezone.utc).isoformat()
+                    }
+
+                    sections_to_insert.append(section_data)
+                    display_order += 1
+
+            # 데이터베이스에 삽입
+            if sections_to_insert:
+                self.supabase.table('newsletter_sections') \
+                    .insert(sections_to_insert) \
+                    .execute()
+
+                logger.info(f"뉴스레터 섹션 저장 완료: {len(sections_to_insert)}개 섹션")
+
+                # 처리된 뉴스의 is_processed 플래그 업데이트
+                all_news_ids = []
+                for data in classified_results.values():
+                    for news in data['items']:
+                        all_news_ids.append(news['id'])
+
+                if all_news_ids:
+                    self.supabase.table('ai_news') \
+                        .update({'is_processed': True}) \
+                        .in_('id', all_news_ids) \
+                        .execute()
+
+                    logger.info(f"처리 완료 플래그 업데이트: {len(all_news_ids)}개")
+
+        except Exception as e:
+            logger.error(f"뉴스레터 섹션 저장 실패: {e}")
+            raise
+
+    def process_daily_news(self) -> None:
+        """일일 뉴스 처리 메인 프로세스"""
+        start_time = time.time()
+        logger.info("=== AI 뉴스 처리 시스템 시작 ===")
+
+        try:
+            # 1. 오늘자 뉴스 수집
+            news_list = self.get_todays_news()
+            if not news_list:
+                logger.info("처리할 뉴스가 없습니다.")
                 return
-                
-            update_data = {'is_processed': True}
-            # Only include updated_at if the column exists
 
-            self.supabase.table('ai_news')\
-                .update(update_data)\
-                .in_('id', news_ids)\
-                .execute()
-            logger.info(f"Marked {len(news_ids)} news items as processed")
+            # 2. 중복 뉴스 제거 (2단계)
+            news_list = self.remove_simple_duplicates(news_list)
+            news_list = self.remove_llm_duplicates(news_list)
+
+            if not news_list:
+                logger.info("중복 제거 후 남은 뉴스가 없습니다.")
+                return
+
+            # 3. 뉴스 분류 및 요약
+            classified_results = self.classify_and_summarize_news(news_list)
+
+            # 4. 데이터베이스 저장
+            self.save_to_newsletter_sections(classified_results)
+
+            # 5. 처리 완료
+            elapsed_time = time.time() - start_time
+            total_processed = sum(len(data['items']) for data in classified_results.values())
+
+            logger.info(f"=== 처리 완료 ===")
+            logger.info(f"처리 시간: {elapsed_time:.2f}초")
+            logger.info(f"처리된 뉴스: {total_processed}개")
+            logger.info(f"생성된 섹션: {len(classified_results)}개")
+
         except Exception as e:
-            logger.error(f"Error marking news as processed: {str(e)}")
+            logger.error(f"뉴스 처리 중 오류 발생: {e}")
             raise
 
-async def main():
-    # Initialize Supabase client
-    supabase_url = os.getenv('SUPABASE_URL')
-    supabase_key = os.getenv('SUPABASE_KEY')
-    together_api_key = os.getenv('TOGETHER_API_KEY')
-    
-    if not all([supabase_url, supabase_key, together_api_key]):
-        logger.error("Missing required environment variables. Please ensure the following are set:\n"
-                   "- SUPABASE_URL\n"
-                   "- SUPABASE_KEY\n"
-                   "- TOGETHER_API_KEY")
-        return
-    
-    # Initialize clients
-    supabase = create_client(supabase_url, supabase_key)
-    classifier = NewsClassifier(api_key=together_api_key)
-    
-    logger.info("Starting news processing...")
-    
+
+def main():
+    """메인 실행 함수"""
     try:
-        # Initialize and run processor
+        # 1. 환경변수 로드
+        load_dotenv()
+
+        together_api_key = os.getenv('TOGETHER_API_KEY')
+        supabase_url = os.getenv('SUPABASE_URL')
+        supabase_key = os.getenv('SUPABASE_KEY')
+
+        if not all([together_api_key, supabase_url, supabase_key]):
+            raise ValueError("필수 환경변수가 설정되지 않았습니다.")
+
+        # 2. Supabase 클라이언트 연결
+        supabase: Client = create_client(supabase_url, supabase_key)
+        logger.info("Supabase 연결 성공")
+
+        # 3. NewsClassifier 인스턴스 생성
+        classifier = NewsClassifier(together_api_key)
+        logger.info("NewsClassifier 초기화 완료")
+
+        # 4. NewsProcessor 인스턴스 생성
         processor = NewsProcessor(supabase, classifier)
-        await processor.process_news()
-        logger.info("News processing completed successfully.")
+        logger.info("NewsProcessor 초기화 완료")
+
+        # 5. 뉴스 처리 실행
+        processor.process_daily_news()
+
     except Exception as e:
-        logger.error(f"Error during news processing: {str(e)}", exc_info=True)
+        logger.error(f"시스템 실행 실패: {e}")
+        raise
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
