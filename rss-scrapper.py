@@ -79,6 +79,9 @@ def fetch_and_store_news():
             try:
                 kr_feed = feedparser.parse(kr_url)
                 if hasattr(kr_feed, 'entries'):
+                    # 한국어 뉴스에 source_country_cd 추가
+                    for entry in kr_feed.entries:
+                        entry.source_country = 'kor'
                     all_entries.extend(kr_feed.entries)
                     logger.info(f"Found {len(kr_feed.entries)} Korean entries for keyword: {keyword}")
             except Exception as e:
@@ -88,6 +91,9 @@ def fetch_and_store_news():
             try:
                 us_feed = feedparser.parse(us_url)
                 if hasattr(us_feed, 'entries'):
+                    # 영어 뉴스에 source_country_cd 추가
+                    for entry in us_feed.entries:
+                        entry.source_country = 'usa'
                     all_entries.extend(us_feed.entries)
                     logger.info(f"Found {len(us_feed.entries)} English entries for keyword: {keyword}")
             except Exception as e:
@@ -134,7 +140,8 @@ def fetch_and_store_news():
                         'keyword': keyword,
                         'pub_date': pub_date.isoformat(),
                         'category': category,
-                        'subcategory': keyword
+                        'subcategory': keyword,
+                        'source_country_cd': getattr(entry, 'source_country', 'unknown')  # 국가 코드 추가
                     }
 
                     # 배치에 데이터 추가
