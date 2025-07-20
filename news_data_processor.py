@@ -4,7 +4,7 @@ import re
 import time
 import logging
 from datetime import datetime, timezone, timedelta
-from difflib import SequenceMatcher
+from urllib.parse import urlparse
 from typing import List, Dict, Any, Optional
 from difflib import SequenceMatcher
 import uuid
@@ -308,29 +308,18 @@ class NewsClassifier:
         titles_text = "\n".join([f"- {item['title']}" for item in news_items])
         category_name = self.categories.get(category, category)
 
-        # 카테고리별 맞춤 프롬프트
-        category_prompts = {
-            "new_services": "새로 출시된 AI 서비스나 모델의 기능, 개발자가 어떻게 활용하거나 새로운 제품/서비스로 확장할 수 있을지 중심으로",
-            "updates": "기존 서비스의 업데이트나 정책 변경이 개발 워크플로우, 도구 선택, 협업 방식에 어떤 영향을 미칠지 중심으로",
-            "investment": "투자나 인수합병이 AI 생태계, 개발자 도구 또는 커뮤니티 활동에 어떤 기회나 리스크를 제공하는지 중심으로",
-            "infrastructure": "새로운 인프라/도구의 기술적 특징과 이를 도입할 때 개발자가 고려해야 할 실질적 요소 중심으로",
-            "trends": "기술 트렌드가 개발자의 미래 역량, 학습 방향, 커리어 설계에 어떤 시사점을 주는지 중심으로",
-            "other": "AI 산업 전반 또는 문화적 현상이 개발자에게 어떤 간접적 영향이나 통찰을 줄 수 있는지 중심으로"
-        }
 
-        focus_area = category_prompts.get(category, category_prompts["other"])
-
-        prompt = f"""당신은 AI 개발 동향을 분석하는 전문 애널리스트입니다.
-    다음은 [{category_name}] 카테고리에 포함된 AI 뉴스 헤드라인 목록입니다:
+        prompt = f"""당신은 AI 기술 트렌드를 분석하여 개발자에게 실질적인 인사이트를 제공하는 전문가입니다.
+    다음은 [{category_name}] 카테고리에 해당하는 AI 뉴스 헤드라인입니다:
 
     {titles_text}
 
     요구사항:
     1. 반드시 한국어로 작성
-    2. 2~3문장 이내로 간결하게 작성하되, 단순 요약이 아니라 **개발자 관점의 핵심 인사이트**를 도출할 것
-    3. {focus_area}
-    4. 개별 뉴스 제목 언급 없이, 공통된 흐름, 기술적 맥락, 시사점 중심으로 설명
-    5. 추상적 표현보다는 실제 개발자 행동/결정에 도움이 되는 문장으로 작성
+    2. 뉴스 개수가 너무 적거나, 유의미한 기술 흐름이나 공통 주제가 포착되지 않을 경우 요약을 생략하고, "**요약에 충분한 정보가 부족합니다.**" 라고만 응답하세요.
+    3. 그렇지 않다면, 2~3문장 이내로 간결하게 작성하되, 단순 요약이 아니라 **개발자 관점의 핵심 인사이트**를 도출해 주세요.
+    4. 뉴스 제목은 직접 언급하지 말고, 공통된 흐름, 기술적 맥락, 시사점 중심으로 설명하세요.
+    5. 가능하다면, 개발자가 고려하거나 행동할 수 있는 구체적인 통찰을 포함하세요.
 
     요약 시작:"""
 
@@ -341,104 +330,208 @@ class NewsClassifier:
             return f"{category_name} 관련 {len(news_items)}건의 뉴스입니다."
 
         content = response.get('choices', [{}])[0].get('message', {}).get('content', '')
+        print(content)
         return content.strip()
 
-    def check_duplicates_batch(self, news_batch: List[Dict], existing_news: List[Dict] = None) -> List[int]:
+    def _get_news_language(self, news_item: Dict) -> str:
+        """뉴스 언어 판별 (한국어/영어)"""
+        # 1. source_country_cd로 먼저 판단
+        if news_item.get('source_country_cd') == 'usa':
+            return 'english'
+        elif news_item.get('source_country_cd') == 'korea':
+            return 'korean'
+
+        # 2. 도메인 기반 판단 (fallback)
+        english_domains = [
+            'techcrunch.com', 'theverge.com', 'wired.com', 'engadget.com',
+            'venturebeat.com', 'arstechnica.com', 'cnet.com', 'zdnet.com',
+            'bloomberg.com', 'reuters.com', 'cnbc.com', 'wsj.com',
+            'nytimes.com', 'washingtonpost.com', 'theguardian.com', 'bbc.com'
+        ]
+
+        if news_item.get('link'):
+            domain = urlparse(news_item['link']).netloc.lower()
+            if any(eng_domain in domain for eng_domain in english_domains):
+                return 'english'
+
+        # 3. 제목의 한글 문자 비율로 판단
+        title = news_item.get('title', '')
+        korean_chars = len([c for c in title if '\uac00' <= c <= '\ud7af'])
+        total_chars = len([c for c in title if c.isalpha()])
+
+        if total_chars > 0 and korean_chars / total_chars > 0.3:
+            return 'korean'
+
+        return 'english'
+
+
+    def _get_duplicate_check_groups(self, news_list: List[Dict]) -> Dict[str, List[Dict]]:
+        """뉴스를 언어와 출처별로 그룹화"""
+        groups = {
+            'korean': [],
+            'english': [],
+            'same_source': {}  # source별 그룹
+        }
+
+        for news in news_list:
+            language = self._get_news_language(news)
+            groups[language].append(news)
+
+            # 동일 출처 그룹화
+            source = news.get('source', 'unknown')
+            if source not in groups['same_source']:
+                groups['same_source'][source] = []
+            groups['same_source'][source].append(news)
+
+        logger.info(f"그룹별 뉴스 수: 한국어 {len(groups['korean'])}개, 영어 {len(groups['english'])}개")
+        logger.info(f"출처별 그룹: {len(groups['same_source'])}개 출처")
+
+        return groups
+
+
+
+    def check_duplicates_batch(self, news_batch: List[Dict], existing_news: List[Dict] = None, check_cross_language: bool = False) -> List[int]:
         """LLM 기반 중복 뉴스 검사 - 수정된 버전"""
         if len(news_batch) <= 1:
             return []
 
-        current_titles = [news['title'] for news in news_batch]
-        existing_titles = [news['title'] for news in (existing_news or [])]
+        # 언어별로 그룹화
+        batch_groups = self._get_duplicate_check_groups(news_batch)
+        existing_groups = self._get_duplicate_check_groups(existing_news or [])
+
+        request_id = str(uuid.uuid4())[:8]
+        logger.info(f"중복 검사 시작 (ID: {request_id}): 배치 {len(news_batch)}개")
+
+        # 상세 로깅
+        for i, news in enumerate(news_batch):
+            lang = self._get_news_language(news)
+            logger.debug(f"뉴스 {i + 1} [{lang}] ({news.get('source', 'N/A')}): {news['title'][:50]}...")
+
+        current_titles = []
+        existing_titles = []
+        title_to_index = {}  # 제목 -> 원본 인덱스 매핑
+
+        # 1. 동일 언어 내 중복 검사를 위한 제목 준비
+        for lang in ['korean', 'english']:
+            batch_lang_news = batch_groups[lang]
+            existing_lang_news = existing_groups[lang]
+
+            if not batch_lang_news:
+                continue
+
+            lang_current_titles = []
+            lang_existing_titles = []
+
+            for news in batch_lang_news:
+                title = news['title']
+                # 원본 배치에서의 인덱스 찾기
+                original_idx = next(i for i, n in enumerate(news_batch) if n['id'] == news['id'])
+                title_to_index[len(current_titles)] = original_idx
+
+                lang_current_titles.append(title)
+                current_titles.append(title)
+
+            for news in existing_lang_news:
+                lang_existing_titles.append(news['title'])
+                existing_titles.append(news['title'])
+
+            logger.debug(f"{lang} 그룹: 현재 {len(lang_current_titles)}개, 기존 {len(lang_existing_titles)}개")
+
+        # 2. 교차 언어 중복 검사 (옵션)
+        if check_cross_language and batch_groups['korean'] and batch_groups['english']:
+            logger.info("교차 언어 중복 검사 수행")
+            # 한국어 뉴스와 영어 뉴스 간 중복 검사 로직 추가 가능
+
+        if not current_titles:
+            return []
 
         all_titles = current_titles + existing_titles
         titles_text = "\n".join([f"{i + 1}. {title}" for i, title in enumerate(all_titles)])
 
-        logger.info(f"중복 검사 시작: 오늘 뉴스 {len(current_titles)}개, 기존 뉴스 {len(existing_titles)}개")
-
-        prompt = f"""다음 AI 뉴스 헤드라인들 중에서 같은 뉴스 이벤트를 다루는 중복된 뉴스를 찾아주세요:
+        # 개선된 프롬프트 - 언어와 출처 정보 포함
+        prompt = f"""다음 AI 뉴스 헤드라인들 중에서 실질적으로 같은 뉴스 이벤트를 다루는 중복을 찾아주세요:
 
     {titles_text}
 
-    기준:
-    - 같은 회사의 같은 제품/서비스/사건을 다루는 경우
-    - 단순히 키워드가 비슷한 것이 아닌, 실제로 같은 뉴스 이벤트인 경우
+    중복 판단 기준 (모든 조건을 만족해야 함):
+    1. 동일한 회사/제품/서비스의 같은 사건/발표를 다루는 경우
+    2. 같은 시점의 같은 이벤트를 보도하는 경우  
+    3. 단순 키워드 유사성이 아닌 실제 뉴스 내용이 동일한 경우
+
+    주의사항:
+    - 같은 회사의 다른 제품/서비스는 중복이 아님
+    - 시간차를 두고 발생한 다른 이벤트는 중복이 아님
+    - 업데이트/후속 보도는 원본과 다른 뉴스임
     - 1번부터 {len(current_titles)}번까지는 오늘 뉴스
     - {len(current_titles) + 1}번부터 {len(all_titles)}번까지는 기존 뉴스
 
-    중요: duplicates 배열에는 오늘 뉴스(1-{len(current_titles)}) 인덱스만 포함해주세요.
+    duplicates 배열에는 오늘 뉴스(1-{len(current_titles)}) 인덱스만 포함해주세요.
 
-    JSON 형식으로만 응답해주세요:
+    JSON 형식으로만 응답:
     {{
       "duplicates": [
         {{
           "primary": 1,
-          "duplicates": [3, 5]
+          "duplicates": [3, 5],
+          "reason": "같은 회사의 동일한 제품 출시 발표"
         }}
       ]
-    }}
-
-    중복이 없으면:
-    {{
-      "duplicates": []
     }}"""
 
         messages = [{"role": "user", "content": prompt}]
 
         response = self._make_api_request(messages, temperature=0.1)
         if not response:
+            logger.warning(f"중복 검사 API 호출 실패 (ID: {request_id})")
             return []
 
         content = response.get('choices', [{}])[0].get('message', {}).get('content', '')
-        request_id = str(uuid.uuid4())[:8]
-
         parsed_result = self._parse_json_response(content, request_id)
+
         if not parsed_result or 'duplicates' not in parsed_result:
             logger.warning(f"중복 검사 결과 파싱 실패 (ID: {request_id})")
             return []
 
-        # 오늘 뉴스 중에서 중복된 것들의 인덱스 추출
+        # 결과 처리 및 상세 로깅
         duplicate_indices = []
-
         for dup_group in parsed_result['duplicates']:
             if not isinstance(dup_group, dict):
                 continue
 
-            # primary 인덱스 처리
+            reason = dup_group.get('reason', '이유 없음')
             primary = dup_group.get('primary')
-            if isinstance(primary, int) and 1 <= primary <= len(current_titles):
-                # primary가 오늘 뉴스 범위에 있으면 중복으로 표시하지 않음 (기준점이므로)
-                pass
-
-            # duplicates 배열 처리
             duplicates_list = dup_group.get('duplicates', [])
-            if not isinstance(duplicates_list, list):
-                continue
 
+            logger.info(f"중복 그룹 발견 (ID: {request_id}): primary={primary}, duplicates={duplicates_list}")
+            logger.info(f"중복 이유: {reason}")
+
+            # primary가 오늘 뉴스 범위에 있으면서 기존 뉴스와 중복인 경우
+            if isinstance(primary, int) and 1 <= primary <= len(current_titles):
+                primary_title = current_titles[primary - 1]
+
+                # 기존 뉴스와의 중복인지 확인
+                has_existing_duplicate = any(
+                    isinstance(idx, int) and idx > len(current_titles)
+                    for idx in duplicates_list
+                )
+
+                if has_existing_duplicate:
+                    original_idx = title_to_index.get(primary - 1)
+                    if original_idx is not None:
+                        duplicate_indices.append(original_idx)
+                        logger.info(f"기존 뉴스와 중복: [{original_idx}] {primary_title[:50]}...")
+
+            # duplicates 배열의 오늘 뉴스들 처리
             for idx in duplicates_list:
-                if isinstance(idx, int):
-                    # 오늘 뉴스 범위 내의 인덱스만 처리
-                    if 1 <= idx <= len(current_titles):
-                        duplicate_indices.append(idx - 1)  # 0-based index로 변환
-                        logger.debug(f"오늘 뉴스 중복 발견: {idx} -> {current_titles[idx - 1]}")
-                    elif idx > len(current_titles):
-                        # 기존 뉴스와의 중복인 경우, primary가 오늘 뉴스라면 해당 primary를 중복으로 표시
-                        if isinstance(primary, int) and 1 <= primary <= len(current_titles):
-                            if primary - 1 not in duplicate_indices:  # 중복 추가 방지
-                                duplicate_indices.append(primary - 1)
-                                logger.debug(f"기존 뉴스와 중복: {primary} -> {current_titles[primary - 1]}")
+                if isinstance(idx, int) and 1 <= idx <= len(current_titles):
+                    original_idx = title_to_index.get(idx - 1)
+                    if original_idx is not None and original_idx not in duplicate_indices:
+                        duplicate_indices.append(original_idx)
+                        dup_title = current_titles[idx - 1]
+                        logger.info(f"중복 뉴스: [{original_idx}] {dup_title[:50]}...")
 
-        # 중복 제거 및 정렬
-        duplicate_indices = sorted(list(set(duplicate_indices)))
-
-        logger.info(f"LLM 중복 검사 완료: {len(duplicate_indices)}개 중복 발견")
-
-        # 디버깅용 로그
-        for idx in duplicate_indices[:5]:  # 최대 5개만 로그
-            if idx < len(current_titles):
-                logger.debug(f"중복 뉴스: {current_titles[idx]}")
-
-        return duplicate_indices
+        logger.info(f"중복 검사 완료 (ID: {request_id}): {len(duplicate_indices)}개 중복 발견")
+        return sorted(duplicate_indices) if duplicate_indices is not None else []
 
 
 class NewsProcessor:
@@ -465,10 +558,10 @@ class NewsProcessor:
             'nytimes.com', 'washingtonpost.com', 'theguardian.com', 'bbc.com'
         ]
         
-        if not news_item.get('link'):
+        if not news_item.get('url'):
             return False
             
-        domain = urlparse(news_item['link']).netloc.lower()
+        domain = urlparse(news_item['url']).netloc.lower()
         return any(eng_domain in domain for eng_domain in english_domains)
 
     def translate_title_to_korean(self, title: str) -> str:
@@ -594,6 +687,61 @@ class NewsProcessor:
             logger.error(f"뉴스 번역 중 오류 발생: {e}")
             return news_list  # 오류 발생 시 기존 리스트 반환
 
+    def _get_news_language(self, news_item: Dict) -> str:
+        """뉴스 언어 판별 (한국어/영어)"""
+        # 1. source_country_cd로 먼저 판단
+        if news_item.get('source_country_cd') == 'usa':
+            return 'english'
+        elif news_item.get('source_country_cd') == 'korea':
+            return 'korean'
+
+        # 2. 도메인 기반 판단 (fallback)
+        english_domains = [
+            'techcrunch.com', 'theverge.com', 'wired.com', 'engadget.com',
+            'venturebeat.com', 'arstechnica.com', 'cnet.com', 'zdnet.com',
+            'bloomberg.com', 'reuters.com', 'cnbc.com', 'wsj.com',
+            'nytimes.com', 'washingtonpost.com', 'theguardian.com', 'bbc.com'
+        ]
+
+        if news_item.get('url'):
+            domain = urlparse(news_item['url']).netloc.lower()
+            if any(eng_domain in domain for eng_domain in english_domains):
+                return 'english'
+
+        # 3. 제목의 한글 문자 비율로 판단
+        title = news_item.get('title', '')
+        korean_chars = len([c for c in title if '\uac00' <= c <= '\ud7af'])
+        total_chars = len([c for c in title if c.isalpha()])
+
+        if total_chars > 0 and korean_chars / total_chars > 0.3:
+            return 'korean'
+
+        return 'english'
+
+    def _get_duplicate_check_groups(self, news_list: List[Dict]) -> Dict[str, List[Dict]]:
+        """뉴스를 언어와 출처별로 그룹화"""
+        groups = {
+            'korean': [],
+            'english': [],
+            'same_source': {}  # source별 그룹
+        }
+
+        for news in news_list:
+            language = self._get_news_language(news)
+            groups[language].append(news)
+
+            # 동일 출처 그룹화
+            source = news.get('source', 'unknown')
+            if source not in groups['same_source']:
+                groups['same_source'][source] = []
+            groups['same_source'][source].append(news)
+
+        logger.info(f"그룹별 뉴스 수: 한국어 {len(groups['korean'])}개, 영어 {len(groups['english'])}개")
+        logger.info(f"출처별 그룹: {len(groups['same_source'])}개 출처")
+
+        return groups
+
+
     def remove_simple_duplicates(self, news_list: List[Dict]) -> List[Dict]:
         """1단계: 빠른 유사도 검사로 중복 제거"""
         if not news_list:
@@ -632,23 +780,104 @@ class NewsProcessor:
 
         return unique_news
 
-    def remove_llm_duplicates(self, news_list: List[Dict]) -> List[Dict]:
-        """2단계: LLM 기반 정교한 중복 검사 - 개선된 버전"""
+    def remove_same_source_duplicates(self, news_list: List[Dict]) -> List[Dict]:
+        """동일 출처 기사의 고급 중복 검사"""
         if len(news_list) <= 1:
             return news_list
 
-        logger.info("2단계 중복 검사 시작 (LLM 기반)")
+        logger.info("동일 출처 중복 검사 시작")
 
-        # 이전 24시간 뉴스 조회 (최대 100개로 제한)
+        # 출처별 그룹화
+        source_groups = {}
+        for i, news in enumerate(news_list):
+            source = news.get('source', 'unknown')
+            if source not in source_groups:
+                source_groups[source] = []
+            source_groups[source].append((i, news))
+
+        duplicate_indices = set()
+
+        # 각 출처별로 중복 검사
+        for source, news_group in source_groups.items():
+            if len(news_group) <= 1:
+                continue
+
+            logger.info(f"출처 '{source}': {len(news_group)}개 기사 중복 검사")
+
+            # 동일 출처 내에서 시간과 제목 유사도 기반 중복 검사
+            for i in range(len(news_group)):
+                for j in range(i + 1, len(news_group)):
+                    idx1, news1 = news_group[i]
+                    idx2, news2 = news_group[j]
+
+                    # 이미 중복으로 표시된 뉴스는 건너뛰기
+                    if idx1 in duplicate_indices or idx2 in duplicate_indices:
+                        continue
+
+                    # 제목 유사도 검사
+                    title1 = news1['title'].strip().lower()
+                    title2 = news2['title'].strip().lower()
+                    similarity = SequenceMatcher(None, title1, title2).ratio()
+
+                    # 게시 시간 차이 검사 (1시간 이내)
+                    time_diff = self._calculate_time_difference(news1, news2)
+
+                    # 중복 조건: 높은 유사도 + 짧은 시간차
+                    if similarity >= 0.85 and time_diff <= 3600:  # 1시간
+                        # 더 최근 뉴스를 유지하고 이전 뉴스를 중복으로 표시
+                        if news1.get('pub_date', '') < news2.get('pub_date', ''):
+                            duplicate_indices.add(idx1)
+                            logger.info(f"동일 출처 중복 제거: {news1['title'][:50]}...")
+                        else:
+                            duplicate_indices.add(idx2)
+                            logger.info(f"동일 출처 중복 제거: {news2['title'][:50]}...")
+
+        # 중복이 아닌 뉴스만 반환
+        unique_news = [news for i, news in enumerate(news_list) if i not in duplicate_indices]
+        logger.info(f"동일 출처 중복 검사 완료: {len(duplicate_indices)}개 제거, {len(unique_news)}개 남음")
+
+        return unique_news
+
+    def _calculate_time_difference(self, news1: Dict, news2: Dict) -> int:
+        """두 뉴스 간의 시간 차이를 초 단위로 계산"""
+        try:
+            time1 = datetime.fromisoformat(news1.get('pub_date', '').replace('Z', '+00:00'))
+            time2 = datetime.fromisoformat(news2.get('pub_date', '').replace('Z', '+00:00'))
+            return abs((time1 - time2).total_seconds())
+        except:
+            return float('inf')  # 시간 정보가 없으면 무한대 차이
+
+    def remove_llm_duplicates(self, news_list: List[Dict]) -> List[Dict]:
+        """개선된 2단계: LLM 기반 정교한 중복 검사"""
+        if len(news_list) <= 1:
+            return news_list
+
+        logger.info("2단계 중복 검사 시작 (개선된 LLM 기반)")
+
+        # 1. 동일 출처 중복 먼저 제거
+        news_list = self.remove_same_source_duplicates(news_list)
+
+        if len(news_list) <= 1:
+            return news_list
+
+        # 2. 언어별 그룹 확인
+        groups = self._get_duplicate_check_groups(news_list)
+        korean_count = len(groups['korean'])
+        english_count = len(groups['english'])
+
+        logger.info(f"언어별 분포: 한국어 {korean_count}개, 영어 {english_count}개")
+
+        # 3. 기존 뉴스 조회 (언어별 분리)
         today = datetime.now(self.kst)
         today_start_utc = today.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
 
         existing_news = []
         try:
             existing_response = self.supabase.table('ai_news') \
-                .select('title') \
+                .select('title, source, source_country_cd, url') \
                 .gte('pub_date', today_start_utc.isoformat()) \
                 .eq('is_processed', True) \
+                .limit(150) \
                 .execute()
             existing_news = existing_response.data
             logger.info(f"기존 뉴스 조회 완료: {len(existing_news)}개")
@@ -658,43 +887,81 @@ class NewsProcessor:
 
         duplicate_indices = set()
 
-        # 배치 단위로 중복 검사 (크기 조정)
-        batch_size = min(20, len(news_list))  # 최대 20개
+        # 4. 언어별 분리된 배치 처리
+        batch_size = 15  # 배치 크기 축소
 
         try:
-            for i in range(0, len(news_list), batch_size):
-                batch = news_list[i:i + batch_size]
-                logger.info(f"배치 중복 검사: {i + 1}-{i + len(batch)}번째 뉴스")
+            # 한국어 뉴스 중복 검사
+            if korean_count > 0:
+                korean_news = groups['korean']
+                korean_existing = [n for n in existing_news if self._get_news_language(n) == 'korean']
 
-                try:
-                    batch_duplicates = self.classifier.check_duplicates_batch(batch, existing_news)
+                for i in range(0, len(korean_news), batch_size):
+                    batch = korean_news[i:i + batch_size]
+                    logger.info(f"한국어 뉴스 배치 중복 검사: {i + 1}-{i + len(batch)}번째")
 
-                    # 전체 인덱스로 변환 및 검증
-                    for dup_idx in batch_duplicates:
-                        global_idx = i + dup_idx
-                        if 0 <= global_idx < len(news_list):
-                            duplicate_indices.add(global_idx)
-                        else:
-                            logger.warning(f"잘못된 중복 인덱스: {global_idx} (전체 뉴스: {len(news_list)}개)")
+                    try:
+                        batch_duplicates = self.classifier.check_duplicates_batch(
+                            batch, korean_existing, check_cross_language=False
+                        )
 
-                    logger.info(f"배치 중복 검사 완료: {len(batch_duplicates)}개 중복 발견")
+                        # 전체 리스트에서의 인덱스로 변환
+                        for dup_idx in batch_duplicates:
+                            if 0 <= dup_idx < len(batch):
+                                original_news = batch[dup_idx]
+                                global_idx = next(
+                                    j for j, news in enumerate(news_list)
+                                    if news['id'] == original_news['id']
+                                )
+                                duplicate_indices.add(global_idx)
 
-                    # API 호출 간격 조정
-                    time.sleep(1)
+                        time.sleep(1)  # API 호출 간격
 
-                except Exception as batch_error:
-                    logger.error(f"배치 {i // batch_size + 1} 중복 검사 실패: {batch_error}")
-                    continue
+                    except Exception as batch_error:
+                        logger.error(f"한국어 배치 중복 검사 실패: {batch_error}")
+
+            # 영어 뉴스 중복 검사
+            if english_count > 0:
+                english_news = groups['english']
+                english_existing = [n for n in existing_news if self._get_news_language(n) == 'english']
+
+                for i in range(0, len(english_news), batch_size):
+                    batch = english_news[i:i + batch_size]
+                    logger.info(f"영어 뉴스 배치 중복 검사: {i + 1}-{i + len(batch)}번째")
+
+                    try:
+                        batch_duplicates = self.classifier.check_duplicates_batch(
+                            batch, english_existing, check_cross_language=False
+                        )
+
+                        # 전체 리스트에서의 인덱스로 변환
+                        for dup_idx in batch_duplicates:
+                            if 0 <= dup_idx < len(batch):
+                                original_news = batch[dup_idx]
+                                global_idx = next(
+                                    j for j, news in enumerate(news_list)
+                                    if news['id'] == original_news['id']
+                                )
+                                duplicate_indices.add(global_idx)
+
+                        time.sleep(1)
+
+                    except Exception as batch_error:
+                        logger.error(f"영어 배치 중복 검사 실패: {batch_error}")
 
         except Exception as e:
-            logger.error(f"전체 중복 검사 과정에서 오류: {e}")
+            logger.error(f"중복 검사 과정에서 오류: {e}")
 
-        # 중복 플래그 업데이트
+        # 5. 중복 플래그 업데이트 및 결과 반환
         if duplicate_indices:
             duplicate_ids = []
-            for idx in duplicate_indices:
+            logger.info("=== 중복으로 제거되는 뉴스 목록 ===")
+            for idx in sorted(duplicate_indices):
                 if 0 <= idx < len(news_list) and 'id' in news_list[idx]:
-                    duplicate_ids.append(news_list[idx]['id'])
+                    news_item = news_list[idx]
+                    duplicate_ids.append(news_item['id'])
+                    lang = self._get_news_language(news_item)
+                    logger.info(f"[{idx}] [{lang}] ({news_item.get('source', 'N/A')}): {news_item['title'][:80]}...")
 
             if duplicate_ids:
                 try:
@@ -707,22 +974,8 @@ class NewsProcessor:
                     logger.error(f"중복 플래그 업데이트 실패: {e}")
 
         # 중복이 아닌 뉴스만 반환
-        unique_news = []
-        for i, news in enumerate(news_list):
-            if i not in duplicate_indices:
-                unique_news.append(news)
-
-        logger.info(f"2단계 중복 제거 완료: {len(duplicate_indices)}개 제거, {len(unique_news)}개 남음")
-
-        # 중복 제거 상세 로그 (최대 10개)
-        removed_count = 0
-        for idx in sorted(duplicate_indices)[:10]:
-            if idx < len(news_list):
-                logger.info(f"중복 제거: {news_list[idx].get('title', 'N/A')}")
-                removed_count += 1
-
-        if len(duplicate_indices) > 10:
-            logger.info(f"... 외 {len(duplicate_indices) - 10}개 더")
+        unique_news = [news for i, news in enumerate(news_list) if i not in duplicate_indices]
+        logger.info(f"개선된 2단계 중복 제거 완료: {len(duplicate_indices)}개 제거, {len(unique_news)}개 남음")
 
         return unique_news
 
