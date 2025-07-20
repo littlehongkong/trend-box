@@ -4,6 +4,7 @@ import re
 import time
 import logging
 from datetime import datetime, timezone, timedelta
+from difflib import SequenceMatcher
 from typing import List, Dict, Any, Optional
 from difflib import SequenceMatcher
 import uuid
@@ -11,6 +12,7 @@ import uuid
 import requests
 from supabase import create_client, Client
 from dotenv import load_dotenv
+from deep_translator import GoogleTranslator
 
 # 로깅 설정
 logging.basicConfig(
@@ -449,6 +451,40 @@ class NewsProcessor:
         self.duplicate_threshold = 0.8
         self.kst = timezone(timedelta(hours=9))
 
+    def _is_english_news(self, news_item: Dict) -> bool:
+        """뉴스가 영어로 작성되었는지 확인"""
+        # source_country_cd 필드로 영어 뉴스 판단
+        if news_item.get('source_country_cd') == 'usa':
+            return True
+            
+        # 이전 호환성을 위한 도메인 기반 체크 (점진적으로 제거 예정)
+        english_domains = [
+            'techcrunch.com', 'theverge.com', 'wired.com', 'engadget.com',
+            'venturebeat.com', 'arstechnica.com', 'cnet.com', 'zdnet.com',
+            'bloomberg.com', 'reuters.com', 'cnbc.com', 'wsj.com',
+            'nytimes.com', 'washingtonpost.com', 'theguardian.com', 'bbc.com'
+        ]
+        
+        if not news_item.get('link'):
+            return False
+            
+        domain = urlparse(news_item['link']).netloc.lower()
+        return any(eng_domain in domain for eng_domain in english_domains)
+
+    def translate_title_to_korean(self, title: str) -> str:
+        """뉴스 제목을 한국어로 번역"""
+        if not title or not title.strip():
+            return ""
+            
+        try:
+            # Google Translator를 사용하여 번역
+            translated = GoogleTranslator(source='en', target='ko').translate(title)
+            logger.info(f"번역 완료: {title} -> {translated}")
+            return translated
+        except Exception as e:
+            logger.error(f"제목 번역 실패: {e}")
+            return ""
+
     def get_todays_news(self) -> List[Dict]:
         """오늘자 뉴스 데이터 수집"""
         # 현재 KST 시간 기준으로 어제 날짜 계산
@@ -466,30 +502,97 @@ class NewsProcessor:
         logger.info(f"오늘 뉴스 조회 (KST): {today_start_kst} ~ {today_end_kst}")
         logger.info(f"오늘 뉴스 조회 (UTC): {today_start_utc} ~ {today_end_utc}")
 
-        logger.info(f"오늘자 뉴스 조회: {today_start_kst} ~ {today_end_kst} (KST)")
-        logger.info(f"오늘자 뉴스 조회(utc): {today_start_utc} ~ {today_end_utc} (KST)")
-
         try:
+            # 오늘자 뉴스 조회
             response = self.supabase.table('ai_news') \
                 .select('*') \
                 .gte('pub_date', today_start_utc.isoformat()) \
                 .lte('pub_date', today_end_utc.isoformat()) \
                 .execute()
 
-            news_list = response.data
+            news_list = response.data if hasattr(response, 'data') else []
             logger.info(f"조회된 뉴스 개수: {len(news_list)}")
 
-            # 제목의 특수문자 정리
+            # 제목 정리
             for news in news_list:
                 if news.get('title'):
-                    news['title'] = re.sub(r'[""''`]', '"', news['title'])
+                    news['title'] = re.sub(r'[\"'']', '"', news['title'])
                     news['title'] = news['title'].strip()
 
-            return news_list
+            # 영어 뉴스 번역 및 news_list 업데이트 후 반환
+            updated_news_list = self.translate_and_update_news(news_list)
+            
+            return updated_news_list if updated_news_list is not None else news_list
 
         except Exception as e:
-            logger.error(f"뉴스 조회 실패: {e}")
+            logger.error(f"뉴스 조회 중 오류 발생: {e}")
             return []
+
+    def translate_and_update_news(self, news_list: List[Dict] = None) -> List[Dict]:
+        """
+        영어 뉴스 제목을 한국어로 번역하여 DB와 news_list에 업데이트
+        
+        Args:
+            news_list: 업데이트할 뉴스 리스트. 제공된 경우 번역된 제목으로 업데이트됨
+            
+        Returns:
+            업데이트된 news_list 또는 None (오류 발생 시)
+        """
+        logger.info("영어 뉴스 번역 시작")
+        
+        if news_list is None:
+            return news_list
+            
+        # 오늘 날짜 범위 계산 (KST 기준)
+        today = datetime.now(self.kst)
+        today_start_kst = today.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_end_kst = today.replace(hour=23, minute=59, second=59, microsecond=999999)
+
+        try:
+            # 1. news_list에서 미국 뉴스이면서 title_kr이 없는 항목 찾기
+            news_to_translate = [
+                news for news in news_list 
+                if (news.get('source_country_cd') == 'usa' or self._is_english_news(news)) 
+                and not news.get('title_kr') 
+                and news.get('title')
+            ]
+            
+            logger.info(f"번역이 필요한 미국 뉴스 {len(news_to_translate)}개 발견")
+            
+            # 2. 번역 및 업데이트
+            updated_count = 0
+            for news in news_to_translate:
+                try:
+                    # 한국어로 번역
+                    translated = self.translate_title_to_korean(news['title'])
+                    if not translated:
+                        continue
+                        
+                    # DB 업데이트
+                    update_result = self.supabase.table('ai_news') \
+                        .update({'title_kr': translated}) \
+                        .eq('id', news['id']) \
+                        .execute()
+                    
+                    # news_list 업데이트
+                    news['title_kr'] = translated
+                    updated_count += 1
+                    
+                    # 로깅 간소화 (너무 많은 로그 방지)
+                    if updated_count % 10 == 0 or updated_count == len(news_to_translate):
+                        logger.info(f"{updated_count}/{len(news_to_translate)}개 번역 완료")
+                        
+                except Exception as e:
+                    logger.error(f"뉴스 번역/업데이트 실패 (ID: {news.get('id')}): {e}")
+            
+            logger.info(f"총 {updated_count}개의 뉴스 제목이 번역되어 업데이트되었습니다.")
+            
+            # 업데이트된 news_list 반환
+            return news_list
+            
+        except Exception as e:
+            logger.error(f"뉴스 번역 중 오류 발생: {e}")
+            return news_list  # 오류 발생 시 기존 리스트 반환
 
     def remove_simple_duplicates(self, news_list: List[Dict]) -> List[Dict]:
         """1단계: 빠른 유사도 검사로 중복 제거"""
@@ -699,13 +802,20 @@ class NewsProcessor:
                     # 뉴스 항목 정보 준비
                     news_items = []
                     for news in data['items']:
-                        news_items.append({
+                        # Create a new dictionary with the existing fields
+                        news_item = {
                             'id': news['id'],
                             'title': news['title'],
                             'source': news.get('source', ''),
                             'url': news.get('url', ''),
                             'pub_date': news.get('pub_date', '')
-                        })
+                        }
+                        
+                        # Add Korean title if it exists
+                        if 'title_kr' in news and news['title_kr']:
+                            news_item['title_kr'] = news['title_kr']
+                            
+                        news_items.append(news_item)
 
                     section_data = {
                         'publish_date': today_kst.isoformat(),
