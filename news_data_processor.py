@@ -43,7 +43,7 @@ class NewsClassifier:
             "other": "Other News"
         }
 
-    def _make_api_request(self, messages: List[Dict], temperature: float = 0.5, max_tokens: int = 2000) -> Optional[
+    def _make_api_request(self, messages: List[Dict], temperature: float = 0.1, max_tokens: int = 3000) -> Optional[
         Dict]:
         """Together.ai API 호출"""
         headers = {
@@ -56,7 +56,7 @@ class NewsClassifier:
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
-            "timeout": 120
+            "timeout": 180
         }
 
         request_id = str(uuid.uuid4())[:8]
@@ -239,6 +239,7 @@ class NewsClassifier:
                         continue
 
             logger.error(f"모든 부분적 파싱 시도 실패 (ID: {request_id})")
+            assert False, f"모든 부분적 JSON 파싱 시도가 실패했습니다. (ID: {request_id})"
             return None
 
         except Exception as e:
@@ -252,7 +253,7 @@ class NewsClassifier:
 
         titles_text = "\n".join([f"{i + 1}. {title}" for i, title in enumerate(news_titles)])
 
-        prompt = f"""다음 AI 뉴스 헤드라인들을 6개 카테고리로 분류해주세요:
+        prompt = f"""Classify these AI news headlines. Return ONLY JSON.
 
     {titles_text}
 
@@ -264,18 +265,8 @@ class NewsClassifier:
     5. trends - AI 기술 트렌드, 연구 결과, 업계 동향, 분석 보고서
     6. other - 위 카테고리에 속하지 않는 기타 AI 관련 뉴스
 
-    중요: 반드시 아래 정확한 JSON 형식으로만 응답하세요. 다른 텍스트는 포함하지 마세요.
-
-    {{
-      "new_services": [
-        {{"index": 1, "title": "뉴스 제목"}}
-      ],
-      "updates": [],
-      "investment": [],
-      "infrastructure": [],
-      "trends": [],
-      "other": []
-    }}"""
+    REQUIRED FORMAT:
+    {{"new_services": [{{"index": 1, "title": "exact title"}}], ...}}"""
 
         messages = [{"role": "user", "content": prompt}]
 
@@ -454,22 +445,29 @@ class NewsProcessor:
     def __init__(self, supabase: Client, classifier: NewsClassifier):
         self.supabase = supabase
         self.classifier = classifier
-        self.batch_size = 50
+        self.batch_size = 20
         self.duplicate_threshold = 0.8
         self.kst = timezone(timedelta(hours=9))
 
     def get_todays_news(self) -> List[Dict]:
         """오늘자 뉴스 데이터 수집"""
-        # 현재 KST 날짜 계산
-        now_kst = datetime.now(self.kst) - timedelta(days=1)
-        today_start_kst = now_kst.replace(hour=0, minute=0, second=0, microsecond=0)
-        today_end_kst = now_kst.replace(hour=23, minute=59, second=59, microsecond=999999)
+        # 현재 KST 시간 기준으로 어제 날짜 계산
+        today_kst = datetime.now(self.kst)
+        # 오늘 날짜의 시작 (KST 00:00:00)
+        today_start_kst = today_kst.replace(hour=0, minute=0, second=0, microsecond=0)
 
-        # UTC로 변환
-        today_start_utc = today_start_kst.astimezone(timezone.utc)
-        today_end_utc = today_end_kst.astimezone(timezone.utc)
+        # 오늘 날짜의 끝 (KST 23:59:59.999999)
+        today_end_kst = today_kst.replace(hour=23, minute=59, second=59, microsecond=999999)
+
+        # KST -> UTC 변환 (9시간 전으로 조정)
+        today_start_utc = today_start_kst - timedelta(hours=9)
+        today_end_utc = today_end_kst - timedelta(hours=9)
+
+        logger.info(f"오늘 뉴스 조회 (KST): {today_start_kst} ~ {today_end_kst}")
+        logger.info(f"오늘 뉴스 조회 (UTC): {today_start_utc} ~ {today_end_utc}")
 
         logger.info(f"오늘자 뉴스 조회: {today_start_kst} ~ {today_end_kst} (KST)")
+        logger.info(f"오늘자 뉴스 조회(utc): {today_start_utc} ~ {today_end_utc} (KST)")
 
         try:
             response = self.supabase.table('ai_news') \
