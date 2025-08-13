@@ -4,11 +4,8 @@ import re
 import time
 import logging
 from datetime import datetime, timezone, timedelta
-from urllib.parse import urlparse
-from difflib import SequenceMatcher
-import uuid
 import hashlib
-from typing import Set, Tuple, Dict, List, Any, Optional
+from typing import Dict, List, Optional
 
 import requests
 from supabase import create_client, Client
@@ -87,9 +84,7 @@ class SmartDuplicateFilter:
 
         payload = {
             "model": self.model,
-            "messages": messages,
-            "max_tokens": 1000,
-            "temperature": 0.1
+            "messages": messages
         }
 
         try:
@@ -264,46 +259,46 @@ class KeywordBasedClassifier:
     def __init__(self):
         self.keyword_rules = {
             "new_services": [
-                # 출시, 론칭 관련
+                # 신제품 출시, 신규 서비스, 모델/버전
                 "출시", "론칭", "런칭", "출범", "공개", "발표", "선보", "데뷔",
                 "launch", "release", "unveil", "debut", "introduce", "announce",
-                # 새로운 서비스/제품
-                "새로운", "신규", "첫", "최초", "new", "first", "latest",
-                # 모델명/버전
-                "gpt", "claude", "gemini", "llama", "model", "버전", "version"
+                "신규", "새로운", "첫", "최초", "new", "first", "latest",
+                "버전", "version", "모델", "model",
+                # 신제품 관련 고유 명칭(예: GPT, Claude, Gemini 등)
+                "gpt", "claude", "gemini", "llama"
             ],
             "updates": [
-                # 업데이트 관련
+                # 기능 개선, 보안, 정책, 운영 안정성, UX/UI 변경
                 "업데이트", "개선", "향상", "강화", "추가", "확대", "확장",
                 "update", "improve", "enhance", "upgrade", "expand", "extend",
-                # 정책 관련
-                "정책", "규제", "가이드라인", "policy", "regulation", "guideline"
+                "보안", "security", "안정성", "stability",
+                "거버넌스", "governance",
+                "정책", "규제", "가이드라인", "policy", "regulation", "guideline",
+                "메모리", "context window", "운영", "operation",
+                "UI", "UX", "사용자 환경"
             ],
             "investment": [
-                # 투자 관련
-                "투자", "펀딩", "조달", "투자유치", "시리즈",
-                "investment", "funding", "raise", "series", "round",
-                # 비즈니스 관련
-                "인수", "합병", "파트너십", "협력", "계약",
-                "acquisition", "merger", "partnership", "deal", "contract",
-                # 기업 관련
-                "기업", "회사", "스타트업", "company", "startup", "corp"
+                # 투자, M&A, 기업 협력 및 파트너십
+                "투자", "펀딩", "조달", "투자유치", "시리즈", "round", "funding", "raise", "series",
+                "인수", "합병", "파트너십", "협력", "계약", "acquisition", "merger", "partnership", "deal", "contract",
+                "기업", "회사", "스타트업", "company", "startup", "corp",
+                "인프라 인수", "매수"
             ],
             "infrastructure": [
-                # 인프라 관련
+                # 개발 도구, API, 클라우드, 하드웨어, 플랫폼(기술적 의미)
                 "클라우드", "서버", "gpu", "칩", "반도체", "하드웨어",
                 "cloud", "server", "chip", "semiconductor", "hardware",
-                # 개발 도구
-                "api", "sdk", "플랫폼", "도구", "툴", "framework",
-                "platform", "tool", "development"
+                "api", "sdk", "도구", "툴", "프레임워크", "framework", "tool", "platform", "development",
+                "MCU", "엣지", "edge", "인퍼런스", "배포", "pipeline", "자동화", "automation"
             ],
             "trends": [
-                # 트렌드/연구 관련
-                "연구", "보고서", "분석", "전망", "예측", "동향",
+                # 기술 동향, 연구, 산업 변화, 법규, 분석 리포트
+                "연구", "보고서", "분석", "전망", "예측", "동향", "트렌드",
                 "research", "report", "analysis", "forecast", "trend",
-                # 기술 관련
-                "기술", "혁신", "breakthrough", "technology", "innovation"
-            ]
+                "기술", "혁신", "breakthrough", "technology", "innovation",
+                "규제", "policy", "governance", "법", "법률", "legal", "compliance",
+                "시장", "시장 변화", "산업", "산업 변화"
+            ],
         }
 
     def classify_by_keywords(self, title: str) -> Optional[str]:
@@ -471,20 +466,37 @@ class OptimizedNewsClassifier:
 
         titles_text = "\n".join([f"{i + 1}. {title}" for i, title in enumerate(titles)])
 
-        prompt = f"""다음 AI 뉴스 헤드라인들을 카테고리별로 분류해주세요.
+        prompt = f"""다음 AI 뉴스 헤드라인들을 아래 카테고리 기준에 따라 가장 적절한 항목으로 분류해주세요.
 
 {titles_text}
 
-카테고리:
-- new_services: 새로운 AI 서비스, 제품 출시, 모델 릴리즈
-- updates: 기존 서비스 업데이트, 정책 변경, 기능 개선
-- investment: 투자, 인수합병, 비즈니스 파트너십
-- infrastructure: AI 인프라, 개발 도구, 플랫폼
-- trends: AI 기술 트렌드, 연구 결과, 업계 동향
-- other: 위 카테고리에 속하지 않는 기타
+카테고리 설명:
+- new_services: 신제품 출시, 신규 모델/버전 공개, 신규 서비스 론칭 관련 뉴스
+  예) GPT-5 공개, Claude 신규 요금제 출시
+
+- updates: 기존 서비스 기능 개선, 보안 강화, 정책 및 거버넌스 변경, 사용자 환경(UI/UX) 개선
+  예) 보안 업데이트, 메모리 기능 추가, 정책 변경 안내
+
+- investment: 투자 유치, 인수합병(M&A), 전략적 파트너십, 기업 협력 발표
+  예) AI 스타트업 투자 유치, 구글 크롬 인수 제안
+
+- infrastructure: AI 개발 도구, API, SDK, 클라우드 인프라, 하드웨어, 배포 자동화 관련
+  예) NVIDIA GPU 출시, HuggingFace 라이브러리 업데이트
+
+- trends: 기술 트렌드, 산업 변화, 연구 결과, 법적 규제, 분석 리포트
+  예) AI 산업 전망 보고서, 규제 정책 변화, 연구 결과 발표
+
+- other: 위의 어떤 카테고리에도 명확히 속하지 않는 뉴스
+
+중복되는 주제가 있을 경우, 가장 대표적인 하나의 카테고리로만 분류해주세요.
+
 
 JSON 형식으로만 응답:
-{{"new_services": [{{"index": 0, "title": "제목"}}], "updates": [], ...}}"""
+{{"new_services": [{{"index": 0, "title": "제목"}}], "updates": [], ...}}
+
+중복되는 주제가 있는 경우, 가장 대표적인 하나의 카테고리로만 분류해주세요.
+정확한 JSON 형식만 응답해주세요.
+"""
 
         messages = [{"role": "user", "content": prompt}]
         response = self._make_api_request(messages)
