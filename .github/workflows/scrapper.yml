@@ -34,7 +34,7 @@ jobs:
         run: |
           set -e
           python rss-scrapper.py
-          python news_data_processor.py
+          python data-engineer-rss-scrapper.py
 
   send-newsletter:
     name: Send Newsletter
@@ -59,4 +59,6 @@ jobs:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
+          python news_data_processor.py
           python newsletter_sender.py
+          python data_engineer_news_data_processor.py
