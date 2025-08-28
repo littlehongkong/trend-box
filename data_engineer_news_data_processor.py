@@ -506,7 +506,7 @@ class OptimizedNewsProcessor:
 
     def get_todays_news(self) -> List[Dict]:
         """오늘자 뉴스 데이터 수집"""
-        today_kst = datetime.now(self.kst) - timedelta(days=1)
+        today_kst = datetime.now(self.kst)
         today_start_kst = today_kst.replace(hour=0, minute=0, second=0, microsecond=0)
         today_end_kst = today_kst.replace(hour=23, minute=59, second=59, microsecond=999999)
 
@@ -681,7 +681,7 @@ class OptimizedNewsProcessor:
                 display_order += 1
 
             if sections_to_insert:
-                self.supabase.table('newsletter_sections') \
+                self.supabase.table('data_engineer_sections') \
                     .insert(sections_to_insert) \
                     .execute()
 
