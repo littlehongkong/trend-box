@@ -3,4 +3,18 @@ name = "keyword-scrapper"
 version = "0.1.0"
 description = "Add your description here"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "beautifulsoup4>=4.14.3",
+    "feedparser>=6.0.12",
+    "gnews>=0.4.3",
+    "googlenewsdecoder>=0.1.7",
+    "lxml>=6.1.0",
+    "lxml-html-clean>=0.4.4",
+    "newspaper3k>=0.2.8",
+    "openai>=2.33.0",
+    "python-dotenv>=1.2.2",
+    "requests>=2.33.1",
+    "scikit-learn>=1.8.0",
+    "sentence-transformers>=5.4.1",
+    "supabase>=2.29.0",
+]

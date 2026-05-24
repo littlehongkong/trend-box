@@ -1,18 +1,23 @@
+# news_processor_v2.py
+# 변경사항:
+#   - _filter_site_news() 추가: site_news LLM 관련성 필터링
+#   - _summarize_papers() 수정: 논문 URL 포함
+#   - _save_report() 수정: Google News 섹션도 sections_json에 포함
+#   - run() 수정: site_news LLM 필터링 적용
+
 import os
 import json
 import re
 import time
 import logging
 from datetime import datetime, timezone, timedelta
-import hashlib
-from typing import Dict, List, Optional
+from typing import Dict, List
+from crawler import crawl_body
 
-import requests
 from supabase import create_client, Client
 from dotenv import load_dotenv
-from deep_translator import GoogleTranslator
+from openai import OpenAI
 
-# 로깅 설정
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -23,791 +28,768 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+KST = timezone(timedelta(hours=9))
 
-class SmartDuplicateFilter:
-    """키워드 기반 사전 필터링 + 캐싱 + LLM 기반 의미론적 중복 제거"""
+MODEL_FAST    = "gpt-5-nano"
+MODEL_QUALITY = "gpt-5.4-nano"
 
-    def __init__(self, openai_api_key: str = None):
-        self.content_hashes = set()
-        self.title_cache = {}
-        self.similarity_threshold = 0.85
-        self.openai_api_key = openai_api_key
-        self.base_url = "https://api.openai.com/v1/chat/completions"
-        self.model = "gpt-5-nano"
-        self._llm_cache = {}
 
-    def _generate_content_hash(self, news_item: Dict) -> str:
-        """뉴스 항목의 콘텐츠 해시 생성"""
-        content = f"{news_item.get('title', '')}:{news_item.get('source', '')}"
-        return hashlib.md5(content.encode('utf-8')).hexdigest()
+# ─────────────────────────────────────────────────────────────
+# 1. 분류기
+# ─────────────────────────────────────────────────────────────
+class NewsClassifier:
+    SECTIONS = {
+        "new_services":   "🚀 New Services & Launches",
+        "updates":        "🔄 Updates & Policy Changes",
+        "investment":     "💰 Investment & Business",
+        "infrastructure": "🛠 Infrastructure & Dev Tools",
+        "trends":         "📊 Technology Trends & Research",
+        "other":          "📌 Other",
+    }
 
-    def _normalize_title(self, title: str) -> str:
-        """제목 정규화"""
-        title = re.sub(r'[^\w\s가-힣]', '', title.lower())
-        title = re.sub(r'\s+', ' ', title).strip()
-        return title
 
-    def _extract_keywords(self, title: str) -> set:
-        """제목에서 주요 키워드 추출"""
-        keywords = set()
+# ─────────────────────────────────────────────────────────────
+# 2. 리포트 생성기
+# ─────────────────────────────────────────────────────────────
+class WeeklyReportGenerator:
 
-        # 영어 단어 (3글자 이상)
-        english_words = re.findall(r'\b[a-zA-Z]{3,}\b', title.lower())
-        keywords.update(english_words)
+    def __init__(self, client: OpenAI):
+        self.client = client
 
-        # 한글 단어 (2글자 이상)
-        korean_words = re.findall(r'[가-힣]{2,}', title)
-        keywords.update(korean_words)
+    def generate_report(
+        self,
+        big_category: str,
+        classified: Dict[str, List[Dict]],
+        week_label: str,
+        paper_section: str = "",
+        domestic_news: List[Dict] = None,
+        global_news: List[Dict] = None,
+    ) -> str:
+        section_contents = self._prepare_section_contents(classified)
 
-        # 숫자 포함 단어 (버전명, 모델명)
-        number_words = re.findall(r'\b\w*\d+\w*\b', title.lower())
-        keywords.update(number_words)
+        has_news   = any(section_contents.values())
+        has_direct = bool(domestic_news or global_news)
 
-        return keywords
+        if not has_news and not has_direct:
+            return f"# {big_category} 주간 리포트\n\n이번 주 관련 뉴스가 없습니다."
 
-    def _make_llm_request(self, messages: List[Dict]) -> Optional[Dict]:
-        """LLM API 호출 with caching"""
-        if not self.openai_api_key:
-            return None
-
-        content = json.dumps(messages, sort_keys=True)
-        cache_key = hashlib.md5(content.encode('utf-8')).hexdigest()
-
-        if cache_key in self._llm_cache:
-            logger.debug(f"LLM 캐시 히트: {cache_key[:8]}...")
-            return self._llm_cache[cache_key]
-
-        headers = {
-            "Authorization": f"Bearer {self.openai_api_key}",
-            "Content-Type": "application/json"
-        }
-
-        payload = {
-            "model": self.model,
-            "messages": messages
-        }
+        prompt = self._build_report_prompt(
+            big_category, week_label, section_contents,
+            domestic_news or [], global_news or []
+        )
 
         try:
-            response = requests.post(self.base_url, headers=headers, json=payload)
-            response.raise_for_status()
-            result = response.json()
+            resp = self.client.chat.completions.create(
+                model=MODEL_QUALITY,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "당신은 IT 업계 전문 뉴스레터 에디터입니다. "
+                            "독자는 현업 개발자와 기획자입니다. "
+                            "마크다운 형식으로 명확하고 실용적인 인사이트를 제공하세요. "
+                            "반드시 한국어로 작성하세요."
+                        )
+                    },
+                    {"role": "user", "content": prompt}
+                ],
+            )
+            report_text = resp.choices[0].message.content.strip()
 
-            # 캐시에 저장
-            self._llm_cache[cache_key] = result
-            logger.debug(f"LLM API 호출 성공 및 캐시 저장: {cache_key[:8]}...")
+            if paper_section:
+                report_text += f"\n\n---\n{paper_section}"
 
-            return result
-
-        except Exception as e:
-            logger.error(f"LLM API 호출 실패: {e}")
-            return None
-
-    def _check_semantic_duplicates_batch(self, candidates: List[Dict]) -> List[int]:
-        """LLM을 사용한 배치 의미론적 중복 검사"""
-        if not candidates or len(candidates) < 2 or not self.openai_api_key:
-            return []
-
-        # 제목들을 번호와 함께 정리
-        titles_text = "\n".join([
-            f"{i + 1}. {item['title']}"
-            for i, item in enumerate(candidates)
-        ])
-
-        prompt = f"""다음 AI 뉴스 제목들 중에서 의미상 중복되는 항목들을 찾아주세요.
-
-{titles_text}
-
-중복 기준:
-1. 같은 사건/발표를 다루는 경우
-2. 같은 제품/서비스의 같은 업데이트를 다루는 경우
-3. 같은 연구/보고서를 다루는 경우
-4. 표현만 다르고 실질적으로 같은 내용인 경우
-
-중복되는 그룹이 있다면 다음 JSON 형식으로 응답해주세요:
-{{"duplicates": [[1,3], [5,7,9]]}}
-
-중복이 없다면:
-{{"duplicates": []}}
-
-각 그룹에서 첫 번째 번호의 기사를 남기고 나머지를 제거할 예정입니다."""
-
-        messages = [{"role": "user", "content": prompt}]
-        response = self._make_llm_request(messages)
-
-        if not response:
-            return []
-
-        content = response.get('choices', [{}])[0].get('message', {}).get('content', '')
-
-        try:
-            # JSON 파싱
-            json_match = re.search(r'\{.*\}', content, re.DOTALL)
-            if json_match:
-                result = json.loads(json_match.group(0))
-                duplicates = result.get('duplicates', [])
-
-                # 제거할 인덱스들 수집 (각 그룹에서 첫 번째는 보존, 나머지는 제거)
-                to_remove = []
-                for group in duplicates:
-                    if len(group) > 1:
-                        # 인덱스를 0-based로 변환하고, 첫 번째 제외하고 나머지 추가
-                        to_remove.extend([idx - 1 for idx in group[1:]])
-
-                logger.info(f"LLM 중복 검사 결과: {len(duplicates)}개 그룹, {len(to_remove)}개 항목 제거 예정")
-                return to_remove
+            return report_text
 
         except Exception as e:
-            logger.error(f"LLM 중복 검사 결과 파싱 실패: {e}")
+            logger.error(f"리포트 생성 실패: {e}")
+            return ""
 
-        return []
-
-    def is_duplicate(self, news_item: Dict, seen_news: List[Dict]) -> bool:
-        """빠른 중복 검사 (기존 방식)"""
-        title = news_item.get('title', '').strip()
-        if not title:
-            return True
-
-        # 1. 해시 기반 검사
-        content_hash = self._generate_content_hash(news_item)
-        if content_hash in self.content_hashes:
-            return True
-
-        # 2. 정규화된 제목 검사
-        normalized_title = self._normalize_title(title)
-        if normalized_title in self.title_cache:
-            return True
-
-        # 3. 키워드 기반 유사도 검사
-        current_keywords = self._extract_keywords(title)
-        if len(current_keywords) == 0:
-            return False
-
-        for seen_item in seen_news[-20:]:  # 최근 20개만 비교
-            seen_title = seen_item.get('title', '')
-            seen_keywords = self._extract_keywords(seen_title)
-
-            if len(seen_keywords) == 0:
+    def _prepare_section_contents(
+        self, classified: Dict[str, List[Dict]]
+    ) -> Dict[str, List[Dict]]:
+        result = {}
+        for section, news_list in classified.items():
+            if section == 'other':
                 continue
-
-            # Jaccard 유사도 계산
-            intersection = len(current_keywords.intersection(seen_keywords))
-            union = len(current_keywords.union(seen_keywords))
-
-            if union > 0:
-                similarity = intersection / union
-                if similarity >= self.similarity_threshold:
-                    return True
-
-        # 중복이 아니면 캐시에 추가
-        self.content_hashes.add(content_hash)
-        self.title_cache[normalized_title] = True
-
-        return False
-
-    def remove_semantic_duplicates_llm(self, news_list: List[Dict]) -> List[Dict]:
-        """LLM 기반 의미론적 중복 제거 (배치 처리)"""
-        if not news_list or not self.openai_api_key:
-            return news_list
-
-        logger.info(f"LLM 기반 의미론적 중복 제거 시작: {len(news_list)}개")
-
-        # 배치 크기 설정 (한 번에 너무 많이 처리하면 토큰 한계 초과)
-        batch_size = 30  # 30개씩 처리
-        total_removed = 0
-        llm_call_count = 0
-
-        filtered_news = news_list.copy()
-
-        # 배치별로 처리
-        for batch_start in range(0, len(filtered_news), batch_size):
-            batch_end = min(batch_start + batch_size, len(filtered_news))
-            batch = filtered_news[batch_start:batch_end]
-
-            # 배치 크기가 2개 미만이면 중복 검사 불필요
-            if len(batch) < 2:
-                continue
-
-            llm_call_count += 1
-            to_remove_indices = self._check_semantic_duplicates_batch(batch)
-
-            if to_remove_indices:
-                # 역순으로 제거 (인덱스 변화 방지)
-                for idx in sorted(to_remove_indices, reverse=True):
-                    actual_idx = batch_start + idx
-                    if actual_idx < len(filtered_news):
-                        removed_title = filtered_news[actual_idx].get('title', '')[:50]
-                        logger.debug(f"LLM 중복 제거: {removed_title}...")
-                        filtered_news.pop(actual_idx)
-                        total_removed += 1
-
-                # 배치 크기 조정 (제거된 항목 때문에 인덱스가 변했으므로)
-                batch_size = max(20, batch_size - len(to_remove_indices))
-
-            # API 호출 간격 (과도한 호출 방지)
-            if batch_end < len(news_list):
-                time.sleep(0.3)
-
-        logger.info(f"LLM 중복 제거 완료: {total_removed}개 제거, {len(filtered_news)}개 남음")
-        logger.info(f"LLM API 호출 횟수: {llm_call_count}회")
-
-        return filtered_news
-
-
-class KeywordBasedClassifier:
-    """키워드 기반 사전 분류기"""
-
-    def __init__(self):
-        self.keyword_rules = {
-            "new_services": [
-                # 신제품 출시, 신규 서비스, 모델/버전
-                "출시", "론칭", "런칭", "출범", "공개", "발표", "선보", "데뷔",
-                "launch", "release", "unveil", "debut", "introduce", "announce",
-                "신규", "새로운", "첫", "최초", "new", "first", "latest",
-                "버전", "version", "모델", "model",
-                # 신제품 관련 고유 명칭(예: GPT, Claude, Gemini 등)
-                "gpt", "claude", "gemini", "llama"
-            ],
-            "updates": [
-                # 기능 개선, 보안, 정책, 운영 안정성, UX/UI 변경
-                "업데이트", "개선", "향상", "강화", "추가", "확대", "확장",
-                "update", "improve", "enhance", "upgrade", "expand", "extend",
-                "보안", "security", "안정성", "stability",
-                "거버넌스", "governance",
-                "정책", "규제", "가이드라인", "policy", "regulation", "guideline",
-                "메모리", "context window", "운영", "operation",
-                "UI", "UX", "사용자 환경"
-            ],
-            "investment": [
-                # 투자, M&A, 기업 협력 및 파트너십
-                "투자", "펀딩", "조달", "투자유치", "시리즈", "round", "funding", "raise", "series",
-                "인수", "합병", "파트너십", "협력", "계약", "acquisition", "merger", "partnership", "deal", "contract",
-                "기업", "회사", "스타트업", "company", "startup", "corp",
-                "인프라 인수", "매수"
-            ],
-            "infrastructure": [
-                # 개발 도구, API, 클라우드, 하드웨어, 플랫폼(기술적 의미)
-                "클라우드", "서버", "gpu", "칩", "반도체", "하드웨어",
-                "cloud", "server", "chip", "semiconductor", "hardware",
-                "api", "sdk", "도구", "툴", "프레임워크", "framework", "tool", "platform", "development",
-                "MCU", "엣지", "edge", "인퍼런스", "배포", "pipeline", "자동화", "automation"
-            ],
-            "trends": [
-                # 기술 동향, 연구, 산업 변화, 법규, 분석 리포트
-                "연구", "보고서", "분석", "전망", "예측", "동향", "트렌드",
-                "research", "report", "analysis", "forecast", "trend",
-                "기술", "혁신", "breakthrough", "technology", "innovation",
-                "규제", "policy", "governance", "법", "법률", "legal", "compliance",
-                "시장", "시장 변화", "산업", "산업 변화"
-            ],
-        }
-
-    def classify_by_keywords(self, title: str) -> Optional[str]:
-        """키워드 기반 분류"""
-        title_lower = title.lower()
-        scores = {}
-
-        for category, keywords in self.keyword_rules.items():
-            score = 0
-            for keyword in keywords:
-                if keyword.lower() in title_lower:
-                    # 키워드 길이에 따른 가중치
-                    weight = len(keyword) / 5.0
-                    score += weight
-
-            if score > 0:
-                scores[category] = score
-
-        if scores:
-            # 가장 높은 점수의 카테고리 반환
-            return max(scores.items(), key=lambda x: x[1])[0]
-
-        return None
-
-
-class OptimizedNewsClassifier:
-    """최적화된 뉴스 분류기"""
-
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        self.base_url = "https://api.openai.com/v1/chat/completions"
-        self.model = "gpt-5-nano"  # 더 저렴한 모델 사용
-        self._api_cache = {}
-
-        # 키워드 기반 사전 분류기
-        self.keyword_classifier = KeywordBasedClassifier()
-
-        # 뉴스 카테고리 정의
-        self.categories = {
-            "new_services": "New Services/Launches",
-            "updates": "Updates/Policy Changes",
-            "investment": "Investment/Business",
-            "infrastructure": "Infrastructure/Dev Tools",
-            "trends": "Technology Trends",
-            "other": "Other News"
-        }
-
-    def _get_cache_key(self, content: str) -> str:
-        """캐시 키 생성"""
-        return hashlib.md5(content.encode('utf-8')).hexdigest()
-
-    def _make_api_request(self, messages: List[Dict]) -> Optional[Dict]:
-        """OpenAI API 호출 with caching"""
-        content = json.dumps(messages, sort_keys=True)
-        cache_key = self._get_cache_key(content)
-
-        if cache_key in self._api_cache:
-            logger.info(f"캐시 히트: {cache_key[:8]}...")
-            return self._api_cache[cache_key]
-
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        }
-
-        payload = {
-            "model": self.model,
-            "messages": messages
-        }
-
-        try:
-            response = requests.post(self.base_url, headers=headers, json=payload)
-            response.raise_for_status()
-            result = response.json()
-
-            # 캐시에 저장
-            self._api_cache[cache_key] = result
-            logger.info(f"API 호출 성공 및 캐시 저장: {cache_key[:8]}...")
-
-            return result
-
-        except Exception as e:
-            logger.error(f"API 호출 실패: {e}")
-            raise
-
-    def classify_news_optimized(self, news_list: List[Dict]) -> Dict[str, List[Dict]]:
-        """최적화된 뉴스 분류 - 키워드 우선, LLM은 최소한만"""
-
-        classified = {category: [] for category in self.categories.keys()}
-        need_llm_classification = []
-
-        # 1단계: 키워드 기반 사전 분류
-        logger.info("1단계: 키워드 기반 사전 분류 시작")
-
-        for i, news in enumerate(news_list):
-            title = news.get('title', '')
-
-            # 키워드 기반 분류 시도
-            category = self.keyword_classifier.classify_by_keywords(title)
-
-            if category:
-                classified[category].append({
-                    'index': i,
-                    'title': title,
-                    'news_data': news
+            top_news = news_list[:5]
+            enriched = []
+            for news in top_news:
+                enriched.append({
+                    'title':        news.get('title', ''),
+                    'url':          news.get('url', ''),
+                    'source':       news.get('source', ''),
+                    'body_summary': news.get('body_text', '')[:500]
+                                    if news.get('body_text') else None,
                 })
-                logger.debug(f"키워드 분류: [{category}] {title[:50]}...")
-            else:
-                # 키워드로 분류되지 않은 뉴스만 LLM으로 처리
-                need_llm_classification.append((i, title, news))
-
-        keyword_classified_count = sum(len(items) for items in classified.values())
-        logger.info(f"키워드 분류 완료: {keyword_classified_count}/{len(news_list)}개")
-
-        # 2단계: LLM 분류 (키워드로 분류되지 않은 뉴스만)
-        if need_llm_classification:
-            logger.info(f"2단계: LLM 분류 시작 ({len(need_llm_classification)}개)")
-
-            # 배치 크기를 크게 늘림 (한 번에 더 많이 처리)
-            batch_size = 100
-
-            for batch_start in range(0, len(need_llm_classification), batch_size):
-                batch_end = min(batch_start + batch_size, len(need_llm_classification))
-                batch = need_llm_classification[batch_start:batch_end]
-
-                batch_titles = [item[1] for item in batch]
-                llm_results = self._classify_batch_with_llm(batch_titles)
-
-                # 결과 병합
-                for j, (original_idx, title, news_data) in enumerate(batch):
-                    category = 'other'  # 기본값
-
-                    # LLM 분류 결과에서 해당 항목 찾기
-                    for cat, items in llm_results.items():
-                        for item in items:
-                            if item['index'] == j:
-                                category = cat
-                                break
-                        if category != 'other':
-                            break
-
-                    classified[category].append({
-                        'index': original_idx,
-                        'title': title,
-                        'news_data': news_data
-                    })
-
-                # API 호출 간격
-                if batch_end < len(need_llm_classification):
-                    time.sleep(0.5)
-
-        # 통계 출력
-        total_classified = sum(len(items) for items in classified.values())
-        logger.info(f"분류 완료: {total_classified}개")
-        for category, items in classified.items():
-            if items:
-                logger.info(f"  {self.categories[category]}: {len(items)}개")
-
-        return classified
-
-    def _classify_batch_with_llm(self, titles: List[str]) -> Dict[str, List[Dict]]:
-        """LLM을 사용한 배치 분류"""
-        if not titles:
-            return {}
-
-        titles_text = "\n".join([f"{i + 1}. {title}" for i, title in enumerate(titles)])
-
-        prompt = f"""다음 AI 뉴스 헤드라인들을 아래 카테고리 기준에 따라 가장 적절한 항목으로 분류해주세요.
-
-{titles_text}
-
-카테고리 설명:
-- new_services: 신제품 출시, 신규 모델/버전 공개, 신규 서비스 론칭 관련 뉴스
-  예) GPT-5 공개, Claude 신규 요금제 출시
-
-- updates: 기존 서비스 기능 개선, 보안 강화, 정책 및 거버넌스 변경, 사용자 환경(UI/UX) 개선
-  예) 보안 업데이트, 메모리 기능 추가, 정책 변경 안내
-
-- investment: 투자 유치, 인수합병(M&A), 전략적 파트너십, 기업 협력 발표
-  예) AI 스타트업 투자 유치, 구글 크롬 인수 제안
-
-- infrastructure: AI 개발 도구, API, SDK, 클라우드 인프라, 하드웨어, 배포 자동화 관련
-  예) NVIDIA GPU 출시, HuggingFace 라이브러리 업데이트
-
-- trends: 기술 트렌드, 산업 변화, 연구 결과, 법적 규제, 분석 리포트
-  예) AI 산업 전망 보고서, 규제 정책 변화, 연구 결과 발표
-
-- other: 위의 어떤 카테고리에도 명확히 속하지 않는 뉴스
-
-중복되는 주제가 있을 경우, 가장 대표적인 하나의 카테고리로만 분류해주세요.
-
-
-JSON 형식으로만 응답:
-{{"new_services": [{{"index": 0, "title": "제목"}}], "updates": [], ...}}
-
-중복되는 주제가 있는 경우, 가장 대표적인 하나의 카테고리로만 분류해주세요.
-정확한 JSON 형식만 응답해주세요.
-"""
-
-        messages = [{"role": "user", "content": prompt}]
-        response = self._make_api_request(messages)
-
-        if not response:
-            return {}
-
-        content = response.get('choices', [{}])[0].get('message', {}).get('content', '')
-
-        try:
-            # JSON 파싱
-            json_match = re.search(r'\{.*\}', content, re.DOTALL)
-            if json_match:
-                result = json.loads(json_match.group(0))
-                return result
-        except Exception as e:
-            logger.error(f"LLM 분류 결과 파싱 실패: {e}")
-
-        return {}
-
-    def generate_summary(self, category: str, news_items: List[Dict]) -> str:
-        """카테고리별 요약 생성 - 더 효율적으로"""
-        if not news_items or len(news_items) < 3:
-            return "**요약에 충분한 정보가 부족합니다.**"
-
-        # 제목만 추출하여 토큰 수 최소화
-        titles = [item.get('title', '') for item in news_items[:15]]  # 최대 15개만
-        titles_text = "\n".join([f"- {title}" for title in titles if title])
-
-        category_name = self.categories.get(category, category)
-
-        prompt = f"""다음 [{category_name}] 카테고리 AI 뉴스들의 핵심 트렌드를 2-3문장으로 요약하세요:
-
-{titles_text}
-
-개발자 관점의 실용적 인사이트를 중심으로 간결하게 작성해주세요."""
-
-        messages = [{"role": "user", "content": prompt}]
-        response = self._make_api_request(messages)
-
-        if not response:
-            return f"{category_name} 관련 {len(news_items)}건의 뉴스입니다."
-
-        content = response.get('choices', [{}])[0].get('message', {}).get('content', '')
-        return content.strip()
-
-
-
-class OptimizedNewsProcessor:
-    """최적화된 뉴스 처리기 (LLM 중복 제거 추가)"""
-
-    def __init__(self, supabase: Client, classifier: OptimizedNewsClassifier):
-        self.supabase = supabase
-        self.classifier = classifier
-        # LLM 중복 제거를 위해 OpenAI API 키 전달
-        self.duplicate_filter = SmartDuplicateFilter(classifier.api_key)
-        self.kst = timezone(timedelta(hours=9))
-
-    def get_todays_news(self) -> List[Dict]:
-        """오늘자 뉴스 데이터 수집"""
-        today_kst = datetime.now(self.kst)
-        today_start_kst = today_kst.replace(hour=0, minute=0, second=0, microsecond=0)
-        today_end_kst = today_kst.replace(hour=23, minute=59, second=59, microsecond=999999)
-
-        today_start_utc = today_start_kst - timedelta(hours=9)
-        today_end_utc = today_end_kst - timedelta(hours=9)
-
-        logger.info(f"뉴스 조회 범위: {today_start_kst} ~ {today_end_kst} (KST)")
-
-        try:
-            response = self.supabase.table('ai_news') \
-                .select('*') \
-                .gte('pub_date', today_start_utc.isoformat()) \
-                .lte('pub_date', today_end_utc.isoformat()) \
-                .eq('is_duplicate', False) \
-                .execute()
-
-            news_list = response.data if hasattr(response, 'data') else []
-            logger.info(f"조회된 뉴스: {len(news_list)}개")
-
-            # 제목 정리
-            for news in news_list:
-                if news.get('title'):
-                    news['title'] = re.sub(r'[\"'']', '"', news['title']).strip()
-
-            return news_list
-
-        except Exception as e:
-            logger.error(f"뉴스 조회 실패: {e}")
-            return []
-
-    def remove_duplicates_smart(self, news_list: List[Dict]) -> List[Dict]:
-        """스마트 중복 제거 (기존 방식 + LLM 추가)"""
-        if len(news_list) <= 1:
-            return news_list
-
-        logger.info(f"스마트 중복 제거 시작: {len(news_list)}개")
-
-        # 1단계: 기존 방식으로 중복 제거
-        unique_news = []
-        news_list.sort(key=lambda x: x.get('pub_date', ''), reverse=True)
-
-        for news in news_list:
-            if not self.duplicate_filter.is_duplicate(news, unique_news):
-                unique_news.append(news)
-
-        removed_count_step1 = len(news_list) - len(unique_news)
-        logger.info(f"1단계 (키워드 기반) 중복 제거: {removed_count_step1}개 제거, {len(unique_news)}개 남음")
-
-        # 2단계: LLM 기반 의미론적 중복 제거
-        if len(unique_news) >= 10:  # 충분한 뉴스가 있을 때만 LLM 사용
-            final_news = self.duplicate_filter.remove_semantic_duplicates_llm(unique_news)
-            removed_count_step2 = len(unique_news) - len(final_news)
-            logger.info(f"2단계 (LLM 기반) 중복 제거: {removed_count_step2}개 추가 제거")
-        else:
-            final_news = unique_news
-            logger.info("뉴스 수가 부족하여 LLM 중복 제거 생략")
-
-        total_removed = len(news_list) - len(final_news)
-        logger.info(f"총 중복 제거: {total_removed}개 제거, {len(final_news)}개 최종 남음")
-
-        return final_news
-
-    # 나머지 메서드들은 기존과 동일...
-    def _is_english_news(self, news_item: Dict) -> bool:
-        """영어 뉴스 판별"""
-        return news_item.get('source_country_cd') == 'usa'
-
-    def translate_english_news(self, news_list: List[Dict]) -> None:
-        """영어 뉴스 제목 번역 (배치 처리)"""
-        english_news = [
-            news for news in news_list
-            if self._is_english_news(news) and not news.get('title_kr') and news.get('title')
-        ]
-
-        if not english_news:
-            return
-
-        logger.info(f"영어 뉴스 번역 시작: {len(english_news)}개")
-
-        translated_count = 0
-        for news in english_news:
+            result[section] = enriched
+        return result
+
+    def _build_report_prompt(
+        self,
+        big_category: str,
+        week_label: str,
+        section_contents: Dict[str, List[Dict]],
+        domestic_news: List[Dict],
+        global_news: List[Dict],
+    ) -> str:
+        section_labels = NewsClassifier.SECTIONS
+
+        # Google News 섹션
+        sections_text = ""
+        for section, items in section_contents.items():
+            if not items:
+                continue
+            label = section_labels.get(section, section)
+            sections_text += f"\n### {label}\n"
+            for item in items:
+                sections_text += f"- **{item['title']}** ({item['source']})\n"
+                sections_text += f"  URL: {item['url']}\n"
+                if item.get('body_summary'):
+                    sections_text += f"  본문: {item['body_summary']}\n"
+
+        # 국내 직접 소스
+        domestic_text = ""
+        for item in domestic_news[:8]:
+            domestic_text += f"- **{item['title']}** ({item['source']})\n"
+            if item.get('body_text'):
+                domestic_text += f"  내용: {item['body_text'][:300]}\n"
+            domestic_text += f"  출처: {item['url']}\n"
+
+        # 해외 직접 소스
+        global_text = ""
+        for item in global_news[:5]:
+            title   = item['title']
+            summary = item.get('summary_ko') or item.get('body_text', '')[:200]
+            global_text += f"- **{title}** ({item['source']})\n"
+            if summary:
+                global_text += f"  요약: {summary}\n"
+            global_text += f"  출처: {item['url']}\n"
+
+        return f"""다음 뉴스를 바탕으로 [{big_category}] 분야 {week_label} 주간 리포트를 작성해주세요.
+
+## 국내 주요 뉴스 (AI타임스/ZDNet Korea/IT조선/GeekNews)
+{domestic_text if domestic_text else "해당 없음"}
+
+## 글로벌 동향 (TechCrunch/The Verge)
+{global_text if global_text else "해당 없음"}
+
+## 기타 뉴스 (Google News)
+{sections_text if sections_text else "해당 없음"}
+
+리포트 형식:
+---
+# {big_category} 주간 동향 | {week_label}
+
+## 🔑 이번 주 핵심 요약
+(3줄 이내 핵심 동향 요약)
+
+## 섹션별 상세
+
+### 📰 국내 주요 뉴스
+(AI타임스/ZDNet Korea/IT조선/GeekNews 기사 중심)
+(각 항목마다: 제목, 2~3줄 핵심 내용 요약, 출처)
+
+### 🌐 글로벌 동향
+(TechCrunch/The Verge 기사 중심, 한국어 요약)
+(각 항목마다: 제목, 2~3줄 핵심 내용 요약, 출처)
+
+### 📡 추가 뉴스 (Google News)
+(위 섹션에서 다루지 않은 주요 뉴스, 내용 있는 것만)
+(각 항목마다: 제목, 1~2줄 요약, 출처)
+
+## 💡 실무 적용 포인트
+(개발자/기획자가 지금 바로 챙겨야 할 액션 아이템 2~3개)
+(각 포인트마다 왜 중요한지, 어떻게 적용할지 구체적으로)
+---
+
+규칙:
+- 국내 뉴스와 글로벌 동향 섹션을 반드시 먼저 작성
+- 해외 기사는 반드시 한국어로 요약
+- 내용 없는 섹션은 생략
+- 각 항목에 출처 포함
+- 전체 한국어 작성
+- 실무자가 바로 활용할 수 있는 인사이트 위주로"""
+
+
+# ─────────────────────────────────────────────────────────────
+# 3. 메인 프로세서
+# ─────────────────────────────────────────────────────────────
+class WeeklyNewsProcessor:
+    BIG_CATEGORIES = ["AI", "데이터엔지니어링", "RPA"]
+
+    # 카테고리별 컨텍스트 (LLM 필터링용)
+    CATEGORY_CONTEXT = {
+        "AI": "LLM, 에이전트, 생성형AI, AI모델, AI서비스, AI정책, AI인프라, 오케스트레이션, MCP, RAG",
+        "데이터엔지니어링": "데이터파이프라인, RAG, 벡터DB, 데이터거버넌스, 지식그래프, 데이터품질, ETL, GraphRAG",
+        "RPA": "업무자동화, 프로세스자동화, 문서AI, OCR, 워크플로, RPA, IDP, 에이전틱자동화",
+    }
+
+    def __init__(self, supabase: Client, client: OpenAI):
+        self.supabase   = supabase
+        self.client     = client
+        self.report_gen = WeeklyReportGenerator(client)
+
+    # ── 데이터 조회 ───────────────────────────────────────────
+
+    def get_weeks_news(self, days: int = 7) -> Dict[str, List[Dict]]:
+        """최근 N일간 대분류별 뉴스 수집 (Google News)"""
+        now   = datetime.now(KST)
+        start = now - timedelta(days=days)
+        result = {}
+
+        for cat in self.BIG_CATEGORIES:
             try:
-                translated = GoogleTranslator(source='en', target='ko').translate(news['title'])
-                if translated:
-                    # DB 업데이트
-                    self.supabase.table('ai_news') \
-                        .update({'title_kr': translated}) \
-                        .eq('id', news['id']) \
-                        .execute()
+                resp = self.supabase.table('ai_news') \
+                    .select('*') \
+                    .eq('category', cat) \
+                    .gte('pub_date', start.isoformat()) \
+                    .order('pub_date', desc=True) \
+                    .execute()
 
-                    # 메모리 상의 객체도 업데이트
-                    news['title_kr'] = translated
-                    translated_count += 1
+                result[cat] = resp.data or []
+                logger.info(f"[{cat}] Google News {len(result[cat])}개 수집")
 
             except Exception as e:
-                logger.error(f"번역 실패 (ID: {news.get('id')}): {e}")
+                logger.error(f"[{cat}] 뉴스 조회 실패: {e}")
+                result[cat] = []
 
-        logger.info(f"번역 완료: {translated_count}개")
+        return result
 
-    def process_and_save_news(self, news_list: List[Dict]) -> None:
-        """뉴스 처리 및 저장"""
+    def get_weeks_site_news(self, days: int = 7) -> Dict[str, Dict[str, List[Dict]]]:
+        """최근 N일간 직접 수집 사이트 뉴스 (국내/해외 분리)"""
+        now   = datetime.now(KST)
+        start = now - timedelta(days=days)
+
+        result = {
+            cat: {'domestic': [], 'global': []}
+            for cat in self.BIG_CATEGORIES
+        }
+
+        for cat in self.BIG_CATEGORIES:
+            try:
+                resp = self.supabase.table('site_news') \
+                    .select('*') \
+                    .eq('category', cat) \
+                    .gte('pub_date', start.isoformat()) \
+                    .order('priority', desc=True) \
+                    .order('pub_date', desc=True) \
+                    .execute()
+
+                for row in (resp.data or []):
+                    source_type = row.get('source_type', 'domestic')
+                    if source_type == 'global':
+                        result[cat]['global'].append(row)
+                    else:
+                        result[cat]['domestic'].append(row)
+
+                logger.info(
+                    f"[{cat}] 직접소스: "
+                    f"국내 {len(result[cat]['domestic'])}개 / "
+                    f"해외 {len(result[cat]['global'])}개"
+                )
+
+            except Exception as e:
+                logger.error(f"[{cat}] 직접소스 조회 실패: {e}")
+
+        return result
+
+    def get_weeks_papers(self, days: int = 7) -> Dict[str, List[Dict]]:
+        """최근 N일간 카테고리별 논문 수집"""
+        now   = datetime.now(KST)
+        start = (now - timedelta(days=days)).date().isoformat()
+        result = {}
+
+        for cat in self.BIG_CATEGORIES:
+            try:
+                resp = self.supabase.table('arxiv_papers') \
+                    .select('*') \
+                    .eq('category', cat) \
+                    .gte('published_date', start) \
+                    .order('published_date', desc=True) \
+                    .limit(50) \
+                    .execute()
+
+                result[cat] = resp.data or []
+                logger.info(f"[{cat}] 논문 {len(result[cat])}편")
+
+            except Exception as e:
+                logger.error(f"[{cat}] 논문 조회 실패: {e}")
+                result[cat] = []
+
+        return result
+
+    # ── 필터링/번역/요약 ──────────────────────────────────────
+
+    def _filter_site_news(
+        self, news_list: List[Dict], category: str
+    ) -> List[Dict]:
+        """
+        site_news를 LLM으로 관련성 판단
+        - 키워드 방식 한계 극복
+        - 새로운 용어/표현도 맥락으로 판단
+        - 순천 캐릭터 같은 무관한 기사 제거
+        """
         if not news_list:
-            logger.info("처리할 뉴스가 없습니다.")
-            return
+            return []
 
-        # 분류
-        classified_results = self.classifier.classify_news_optimized(news_list)
+        titles_text = "\n".join([
+            f"{i+1}. {n.get('title', '')}"
+            for i, n in enumerate(news_list)
+        ])
 
-        # 각 카테고리별 요약 생성 (뉴스가 충분한 경우만)
-        summary_results = {}
-        for category, items in classified_results.items():
-            news_data = [item['news_data'] for item in items]
-            if len(items) >= 3:  # 3개 이상인 경우만 요약 생성
-                summary = self.classifier.generate_summary(category, news_data)
-                summary_results[category] = {
-                    'items': news_data,
-                    'summary': summary
-                }
-                logger.info(f"{self.classifier.categories[category]}: {len(items)}개 (요약 생성)")
-            else:
-                summary_results[category] = {
-                    'items': news_data,
-                    'summary': None
-                }
-                logger.info(f"{self.classifier.categories[category]}: {len(items)}개 (요약 생략)")
+        context = self.CATEGORY_CONTEXT.get(category, "IT 기술")
 
-        # 데이터베이스 저장
-        if summary_results:
-            self.save_to_newsletter_sections(summary_results)
+        prompt = f"""다음은 IT 뉴스 제목 목록입니다.
+[{category}] 분야 실무자에게 유의미한 기사 번호만 골라주세요.
+이 분야의 핵심 관심사: [{context}]
 
-    def save_to_newsletter_sections(self, classified_results: Dict[str, Dict]) -> None:
-        """분류 결과를 데이터베이스에 저장"""
-        today_kst = datetime.now(self.kst).date()
+판단 기준:
+포함 ✅: 기술 동향, 신규 서비스/모델, 정책/규제, 투자/인수, 실무 적용 사례
+제외 ❌: 지역 행사/관광/캐릭터, 연예/스포츠, 단순 수상/인사, 
+         부동산/금융상품, 건강식품, 광고성 보도자료, IT와 무관한 산업
+
+{titles_text}
+
+JSON: {{"selected": [1, 3, 5, ...]}}"""
 
         try:
-            # 기존 데이터 삭제
-            self.supabase.table('newsletter_sections') \
+            resp = self.client.chat.completions.create(
+                model=MODEL_FAST,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+            )
+            raw      = json.loads(resp.choices[0].message.content)
+            selected = raw.get('selected', [])
+            result   = [news_list[i-1] for i in selected if 0 < i <= len(news_list)]
+            logger.info(f"  site_news 필터링: {len(news_list)}개 → {len(result)}개")
+            return result
+
+        except Exception as e:
+            logger.error(f"site_news 필터링 실패: {e}")
+            return news_list  # 실패 시 전체 반환
+
+    def _translate_global_news(
+        self, news_list: List[Dict], category: str
+    ) -> List[Dict]:
+        """해외 기사 한국어 요약 (summary_ko 없는 것만)"""
+        to_translate = [n for n in news_list if not n.get('summary_ko')]
+
+        if not to_translate:
+            return news_list
+
+        batch      = to_translate[:10]
+        items_text = ""
+        for i, n in enumerate(batch, 1):
+            body = n.get('body_text', '')[:300] or ''
+            items_text += f"\n{i}. 제목: {n['title']}\n   내용: {body}\n"
+
+        prompt = f"""다음 {category} 분야 해외 IT 기사들을 한국어로 요약해주세요.
+각 기사당 2~3문장으로 핵심 내용만 작성하세요.
+
+{items_text}
+
+JSON: {{"summaries": ["기사1 요약", "기사2 요약", ...]}}"""
+
+        try:
+            resp = self.client.chat.completions.create(
+                model=MODEL_FAST,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+            )
+            raw       = json.loads(resp.choices[0].message.content)
+            summaries = raw.get('summaries', [])
+
+            for i, news in enumerate(batch):
+                if i < len(summaries):
+                    news['summary_ko'] = summaries[i]
+                    try:
+                        self.supabase.table('site_news') \
+                            .update({'summary_ko': summaries[i]}) \
+                            .eq('id', news['id']) \
+                            .execute()
+                    except Exception:
+                        pass
+
+        except Exception as e:
+            logger.error(f"번역 실패: {e}")
+
+        return news_list
+
+    def _summarize_papers(
+        self, papers: List[Dict], category: str, week_label: str
+    ) -> str:
+        """LLM으로 논문 목록 요약 (URL 포함, 초록 핵심 요약)"""
+        if not papers:
+            return ""
+
+        papers_text = ""
+        for i, p in enumerate(papers[:10], 1):
+            abstract = p.get('abstract', '')[:400]  # 초록 더 많이 포함
+            url      = p.get('url', '')
+            papers_text += f"\n{i}. 제목: {p['title']}\n   URL: {url}\n   초록: {abstract}\n"
+
+        prompt = f"""다음은 {week_label} {category} 분야 arXiv 논문 목록입니다.
+
+{papers_text}
+
+아래 형식으로 연구 동향을 요약해주세요:
+
+### 📚 연구 동향 (arXiv)
+(이번 주 주목할 연구 흐름 2~3문장 요약)
+
+**주요 논문:**
+- **[논문 제목]**
+  - 핵심 기여: (무엇을 해결했는지 1~2줄)
+  - 실무 관련성: (어떤 실무 상황에 적용 가능한지 1줄)
+  - 링크: [URL 그대로 사용]
+(상위 3~5편만 선별, 실무 적용 가능성 높은 것 우선)
+
+규칙:
+- 반드시 위 목록에서 제공된 실제 URL을 그대로 사용하세요
+- 한국어로 작성하세요
+- 실무자가 "왜 이 논문이 중요한가"를 바로 알 수 있게 쓰세요"""
+
+        try:
+            resp = self.client.chat.completions.create(
+                model=MODEL_QUALITY,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            logger.error(f"논문 요약 실패: {e}")
+            return ""
+
+    # ── 유틸 ─────────────────────────────────────────────────
+
+    def _get_week_label(self) -> str:
+        now      = datetime.now(KST)
+        week_num = (now.day - 1) // 7 + 1
+        return f"{now.year}년 {now.month}월 {week_num}주차"
+
+    def _rule_based_dedup(self, news_list: List[Dict]) -> List[Dict]:
+        seen_urls   = set()
+        seen_titles = set()
+        result      = []
+
+        for news in news_list:
+            url        = news.get('url', '')
+            title      = news.get('title', '').strip()
+            normalized = re.sub(r'[^\w가-힣]', '', title).lower()
+
+            if url in seen_urls: continue
+            if normalized in seen_titles: continue
+
+            prefix = normalized[:20]
+            if any(t.startswith(prefix) for t in seen_titles): continue
+
+            seen_urls.add(url)
+            seen_titles.add(normalized)
+            result.append(news)
+
+        removed = len(news_list) - len(result)
+        logger.info(f"규칙 기반 중복 제거: {removed}개 제거, {len(result)}개 남음")
+        return result
+
+    def _map_reduce_filter(self, news_list: List[Dict]) -> List[Dict]:
+        candidates = []
+        batch_size = 50
+
+        for i in range(0, len(news_list), batch_size):
+            batch       = news_list[i:i + batch_size]
+            titles_text = "\n".join(
+                [f"{j+1}. {n.get('title', '')}" for j, n in enumerate(batch)]
+            )
+
+            prompt = f"""다음 뉴스 제목에서 IT/AI/데이터/자동화 관련성이 높은 것을
+번호 리스트로 골라주세요. 홍보성/루머/광고는 제외하세요.
+
+{titles_text}
+
+JSON: {{"selected": [1, 3, 5, ...]}}"""
+
+            try:
+                resp = self.client.chat.completions.create(
+                    model=MODEL_FAST,
+                    messages=[{"role": "user", "content": prompt}],
+                    response_format={"type": "json_object"},
+                )
+                raw      = json.loads(resp.choices[0].message.content)
+                selected = raw.get('selected', [])
+                for idx in selected:
+                    actual = idx - 1
+                    if 0 <= actual < len(batch):
+                        candidates.append(batch[actual])
+            except Exception as e:
+                logger.error(f"Map-Reduce 필터 실패: {e}")
+                candidates.extend(batch[:10])
+
+            time.sleep(0.3)
+
+        return candidates
+
+    def _filter_and_classify(self, news_list: List[Dict]) -> Dict:
+        result = {k: [] for k in NewsClassifier.SECTIONS}
+
+        if len(news_list) <= 100:
+            batches = [news_list]
+        else:
+            candidates = self._map_reduce_filter(news_list)
+            batches    = [candidates]
+
+        for batch in batches:
+            titles_text = "\n".join(
+                [f"{j+1}. {n.get('title', '')}" for j, n in enumerate(batch)]
+            )
+
+            prompt = f"""다음 뉴스 제목을 카테고리로 분류하세요.
+
+{titles_text}
+
+카테고리:
+- new_services: 신제품/신규 모델/서비스 출시
+- updates: 기존 서비스 업데이트, 정책 변경
+- investment: 투자, M&A, 파트너십
+- infrastructure: 개발도구, API, 클라우드, 하드웨어
+- trends: 연구, 트렌드, 분석 리포트, 규제
+- other: 홍보성/루머/광고/가치 없는 기사
+
+반드시 other로 분류:
+- 채용/장학/교육 프로그램 홍보
+- 단순 수상/선정 공지
+- 주가/밸류에이션 분석
+- 의료/게임/에너지/관광 등 IT와 무관한 도메인
+
+JSON: {{"new_services":[1,3],"updates":[2],"investment":[],"infrastructure":[4],"trends":[5],"other":[6]}}"""
+
+            try:
+                resp = self.client.chat.completions.create(
+                    model=MODEL_FAST,
+                    messages=[{"role": "user", "content": prompt}],
+                    response_format={"type": "json_object"},
+                )
+                raw = json.loads(resp.choices[0].message.content)
+
+                for section, indices in raw.items():
+                    if section not in result: continue
+                    for idx in indices:
+                        actual = idx - 1
+                        if 0 <= actual < len(batch):
+                            result[section].append(batch[actual])
+
+            except Exception as e:
+                logger.error(f"선별/분류 LLM 실패: {e}")
+                result['other'].extend(batch)
+
+            time.sleep(0.3)
+
+        selected = sum(len(v) for k, v in result.items() if k != 'other')
+        logger.info(f"선별/분류 완료: {len(news_list)}개 → {selected}개 선별")
+        return result
+
+    def _enrich_with_body(self, news_list: List[Dict]) -> List[Dict]:
+        stats = {
+            "success_jina": 0, "success_direct": 0,
+            "decode_failed": 0, "paywalled": 0, "failed": 0
+        }
+
+        for news in news_list:
+            body, status = crawl_body(news.get('url', ''))
+            news['body_text'] = body
+            news['has_body']  = body is not None
+            stats[status]     = stats.get(status, 0) + 1
+            time.sleep(1)
+
+        total   = len(news_list)
+        success = stats['success_jina'] + stats['success_direct']
+        logger.info(
+            f"크롤링 완료: {success}/{total} | "
+            f"Jina {stats['success_jina']} | "
+            f"직접 {stats['success_direct']} | "
+            f"실패 {stats['failed']}"
+        )
+        return news_list
+
+    def _save_report(
+        self,
+        category: str,
+        week_label: str,
+        report_text: str,
+        classified: Dict[str, List[Dict]],
+        domestic_news: List[Dict] = None,
+        global_news: List[Dict] = None,
+    ) -> None:
+        today = datetime.now(KST).date().isoformat()
+
+        sections_data = {}
+
+        # Google News 섹션 (new_services, updates 등)
+        for section, items in classified.items():
+            if section == 'other': continue
+            sections_data[section] = [
+                {
+                    'title':  news.get('title', ''),
+                    'body':   news.get('body_text', '')[:500] if news.get('body_text') else '',
+                    'url':    news.get('real_url') or news.get('url', ''),
+                    'source': news.get('source', ''),
+                }
+                for news in items[:5]
+            ]
+
+        # 국내 직접 소스
+        if domestic_news:
+            sections_data['domestic'] = [
+                {
+                    'title':    n.get('title', ''),
+                    'body':     n.get('body_text', '')[:500] if n.get('body_text') else '',
+                    'url':      n.get('url', ''),
+                    'source':   n.get('source', ''),
+                    'priority': n.get('priority', 5),
+                }
+                for n in domestic_news[:8]
+            ]
+
+        # 해외 직접 소스
+        if global_news:
+            sections_data['global'] = [
+                {
+                    'title':      n.get('title', ''),
+                    'summary_ko': n.get('summary_ko', ''),
+                    'body':       n.get('body_text', '')[:300] if n.get('body_text') else '',
+                    'url':        n.get('url', ''),
+                    'source':     n.get('source', ''),
+                }
+                for n in global_news[:5]
+            ]
+
+        try:
+            self.supabase.table('weekly_reports') \
                 .delete() \
-                .eq('publish_date', today_kst.isoformat()) \
+                .eq('category', category) \
+                .eq('week_label', week_label) \
                 .execute()
 
-            sections_to_insert = []
-            display_order = 1
+            self.supabase.table('weekly_reports').insert({
+                'category':      category,
+                'week_label':    week_label,
+                'report_text':   report_text,
+                'sections_json': json.dumps(sections_data, ensure_ascii=False),
+                'publish_date':  today,
+                'created_at':    datetime.now(timezone.utc).isoformat(),
+            }).execute()
 
-            for category, data in classified_results.items():
-                news_items = []
-                for news in data['items']:
-                    news_item = {
-                        'id': news['id'],
-                        'title': news['title'],
-                        'source': news.get('source', ''),
-                        'url': news.get('url', ''),
-                        'pub_date': news.get('pub_date', '')
-                    }
-
-                    if news.get('title_kr'):
-                        news_item['title_kr'] = news['title_kr']
-
-                    news_items.append(news_item)
-
-                section_data = {
-                    'publish_date': today_kst.isoformat(),
-                    'section_name': category,
-                    'section_title': self.classifier.categories[category],
-                    'summary': data['summary'],
-                    'content': news_items,
-                    'display_order': display_order,
-                    'created_at': datetime.now(timezone.utc).isoformat()
-                }
-
-                sections_to_insert.append(section_data)
-                display_order += 1
-
-            if sections_to_insert:
-                self.supabase.table('newsletter_sections') \
-                    .insert(sections_to_insert) \
-                    .execute()
-
-                # 처리된 뉴스 플래그 업데이트
-                all_news_ids = [news['id'] for data in classified_results.values() for news in data['items']]
-
-                self.supabase.table('ai_news') \
-                    .update({'is_processed': True}) \
-                    .in_('id', all_news_ids) \
-                    .execute()
-
-                logger.info(f"뉴스레터 저장 완료: {len(sections_to_insert)}개 섹션, {len(all_news_ids)}개 뉴스")
+            logger.info(f"[{category}] 리포트 저장 완료")
 
         except Exception as e:
-            logger.error(f"저장 실패: {e}")
-            raise
+            logger.error(f"[{category}] 리포트 저장 실패: {e}")
 
-    def process_daily_news(self) -> None:
-        """일일 뉴스 처리 메인 프로세스"""
-        start_time = time.time()
-        logger.info("=== 최적화된 AI 뉴스 처리 시작 (LLM 중복 제거 포함) ===")
+    # ── 메인 실행 ─────────────────────────────────────────────
 
-        try:
-            # 1. 뉴스 수집
-            news_list = self.get_todays_news()
-            if not news_list:
-                logger.info("처리할 뉴스가 없습니다.")
-                return
+    def run(self, days: int = 7) -> None:
+        from embedder import semantic_dedup
+        from scorer import filter_by_score
 
-            # 2. 스마트 중복 제거 (기존 방식 + LLM)
-            news_list = self.remove_duplicates_smart(news_list)
-            if not news_list:
-                logger.info("중복 제거 후 남은 뉴스가 없습니다.")
-                return
+        week_label         = self._get_week_label()
+        news_by_category   = self.get_weeks_news(days)
+        site_news_by_cat   = self.get_weeks_site_news(days)
+        papers_by_category = self.get_weeks_papers(days)
 
-            # 3. 영어 뉴스 번역
-            self.translate_english_news(news_list)
+        for big_cat in self.BIG_CATEGORIES:
+            news_list = news_by_category.get(big_cat, [])
+            site_data = site_news_by_cat.get(big_cat, {'domestic': [], 'global': []})
 
-            # 4. 분류 및 저장
-            self.process_and_save_news(news_list)
+            domestic_news = site_data['domestic']
+            global_news   = site_data['global']
 
-            # 완료 로그
-            elapsed_time = time.time() - start_time
-            logger.info(f"=== 처리 완료 ===")
-            logger.info(f"처리 시간: {elapsed_time:.2f}초")
-            logger.info(f"최종 처리된 뉴스: {len(news_list)}개")
+            if not news_list and not domestic_news and not global_news:
+                logger.info(f"[{big_cat}] 수집된 뉴스 없음, 스킵")
+                continue
 
-        except Exception as e:
-            logger.error(f"처리 중 오류: {e}")
-            raise
+            logger.info(
+                f"\n[{big_cat}] 시작: "
+                f"Google {len(news_list)}개 / "
+                f"국내직접 {len(domestic_news)}개 / "
+                f"해외직접 {len(global_news)}개"
+            )
+
+            # ── site_news LLM 필터링 (순천 캐릭터 같은 무관 기사 제거) ──
+            if domestic_news:
+                domestic_news = self._filter_site_news(domestic_news, big_cat)
+
+            if global_news:
+                global_news = self._filter_site_news(global_news, big_cat)
+
+            # ── Google News 처리 ──────────────────────────────
+            if news_list:
+                news_list = self._rule_based_dedup(news_list)
+                logger.info(f"  규칙 중복제거 후: {len(news_list)}개")
+
+                news_list = semantic_dedup(news_list, threshold=0.85)
+                logger.info(f"  임베딩 중복제거 후: {len(news_list)}개")
+
+                news_list = filter_by_score(news_list, top_n=100)
+                logger.info(f"  스코어링 후: {len(news_list)}개")
+
+                classified = self._filter_and_classify(news_list)
+
+                for section, items in classified.items():
+                    if section == 'other' or not items: continue
+                    classified[section] = self._enrich_with_body(items[:5])
+            else:
+                classified = {k: [] for k in NewsClassifier.SECTIONS}
+
+            # ── 해외 직접 소스 한국어 요약 ───────────────────
+            if global_news:
+                logger.info(f"  해외 기사 {len(global_news)}개 한국어 요약 중...")
+                global_news = self._translate_global_news(global_news, big_cat)
+
+            # ── 논문 요약 ────────────────────────────────────
+            papers        = papers_by_category.get(big_cat, [])
+            paper_section = self._summarize_papers(papers, big_cat, week_label)
+
+            # ── 리포트 생성 ───────────────────────────────────
+            report = self.report_gen.generate_report(
+                big_category  = big_cat,
+                classified    = classified,
+                week_label    = week_label,
+                paper_section = paper_section,
+                domestic_news = domestic_news,
+                global_news   = global_news,
+            )
+
+            # ── DB 저장 ──────────────────────────────────────
+            self._save_report(
+                category      = big_cat,
+                week_label    = week_label,
+                report_text   = report,
+                classified    = classified,
+                domestic_news = domestic_news,
+                global_news   = global_news,
+            )
+
+        logger.info("\n=== 전체 처리 완료 ===")
 
 
+# ─────────────────────────────────────────────────────────────
+# 실행
+# ─────────────────────────────────────────────────────────────
 def main():
-    """메인 실행 함수"""
-    try:
-        load_dotenv()
+    load_dotenv()
 
-        openai_api_key = os.getenv('OPENAI_API_KEY')
-        supabase_url = os.getenv('SUPABASE_URL')
-        supabase_key = os.getenv('SUPABASE_KEY')
+    openai_api_key = os.getenv('OPENAI_API_KEY')
+    supabase_url   = os.getenv('SUPABASE_URL')
+    supabase_key   = os.getenv('SUPABASE_KEY')
 
-        if not all([openai_api_key, supabase_url, supabase_key]):
-            raise ValueError("필수 환경변수가 설정되지 않았습니다.")
+    if not all([openai_api_key, supabase_url, supabase_key]):
+        raise ValueError(
+            "환경변수 누락: OPENAI_API_KEY, SUPABASE_URL, SUPABASE_KEY 확인"
+        )
 
-        # 클라이언트 초기화
-        supabase: Client = create_client(supabase_url, supabase_key)
-        classifier = OptimizedNewsClassifier(openai_api_key)
-        processor = OptimizedNewsProcessor(supabase, classifier)
+    client   = OpenAI(api_key=openai_api_key)
+    supabase = create_client(supabase_url, supabase_key)
 
-        # 뉴스 처리 실행
-        processor.process_daily_news()
-
-    except Exception as e:
-        logger.error(f"시스템 실행 실패: {e}")
-        raise
+    processor = WeeklyNewsProcessor(supabase, client)
+    processor.run(days=7)
 
 
 if __name__ == "__main__":

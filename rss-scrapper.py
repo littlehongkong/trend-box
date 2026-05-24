@@ -1,13 +1,13 @@
 import os
 import feedparser
 import logging
+import requests
+import re
 from datetime import datetime
 from supabase import create_client
 from dotenv import load_dotenv
-import re
+from bs4 import BeautifulSoup
 
-
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -18,182 +18,394 @@ logging.basicConfig(
 )
 logger = logging.getLogger('rss_scraper')
 
-# Load environment variables
 load_dotenv()
 
-# Supabase setup
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 if not all([SUPABASE_URL, SUPABASE_KEY]):
-    logger.error("Supabase credentials not found in environment variables")
     raise ValueError("Missing Supabase credentials")
 
-try:
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-    logger.info("Successfully connected to Supabase")
-except Exception as e:
-    logger.error(f"Failed to connect to Supabase: {str(e)}")
-    raise
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+logger.info("Supabase 연결 성공")
 
-# 키워드 목록
-CATEGORIES = {
-    "LLM": ["GPT", "ChatGPT", "Claude", "LLaMA", "Mistral", "Mixtral", "Yi", "Command R"],
-    "검색엔진AI": ["Perplexity", "You.com", "Poe", "Phind"],
-    "오픈소스AI": ["Hugging Face", "Ollama", "GPT4All", "OpenRouter"],
-    "AI플랫폼": ["OpenAI", "Anthropic", "Google Gemini", "Meta AI", "Cohere"],
-    "생성형AI": ["Stable Diffusion", "MidJourney", "DALL·E", "Sora", "Pika", "Luma AI"],
-    "AI에이전트": ["AutoGPT", "AgentGPT", "BabyAGI", "AI Agents"],
-    "개발도구": ["LangChain", "LangGraph", "LlamaIndex", "vLLM", "TGI", "ComfyUI", "MLC LLM", "AI Copilot", "GitHub Copilot", "Cursor", "Windsurf"],
-    "기업용AI": ["Enterprise AI", "Edge AI", "TinyML", "On-Device AI"],
+# ── 카테고리 & 키워드 ─────────────────────────────────────────
+CATEGORIES: dict[str, dict[str, list[str]]] = {
+
+    "AI": {
+
+        # 회사/브랜드 (신규 모델 발표, 전략, 네이밍 변경 캐치)
+        "AI_플랫폼": [
+            "OpenAI",
+            "Anthropic",
+            "Google DeepMind",
+            "Meta AI",
+            "xAI",
+            "Mistral AI",
+            "Cohere",
+            "Perplexity AI",
+        ],
+
+        # 모델 패밀리명 (버전 무관, 시리즈 전체 커버)
+        # 버전명(숫자)은 제외 → "GPT" 검색 시 GPT-5, GPT-4.1 등 모두 잡힘
+        "LLM_모델패밀리": [
+            "GPT",  # GPT-5, GPT-4.1-nano 등 전 버전 커버
+            "Claude",  # Claude Opus, Sonnet, Haiku, Mistral 등
+            "Gemini",  # Gemini 2.5 Pro, Flash 등
+            "LLaMA",  # Meta 오픈소스 시리즈
+            "Grok",  # xAI 모델
+            "Copilot",  # MS 코파일럿 시리즈
+            "DeepSeek",  # 중국 오픈소스, 시장 영향력 큼
+            "Qwen",  # Alibaba 모델 시리즈
+            "Gemma",  # Google 오픈소스 시리즈
+        ],
+
+        # LLM 기술 트렌드 (특정 모델 무관한 개념)
+        "LLM_트렌드": [
+            "LLM",
+            "large language model",
+            "foundation model",
+            "거대언어모델",
+            "multimodal model",
+            "reasoning model",
+            "오픈소스 LLM",
+            "context window",  # 주요 경쟁 지표
+            "AI benchmark",  # 모델 성능 비교 뉴스
+        ],
+
+        # AI 에이전트 (가장 빠르게 성장하는 분야)
+        "AI_에이전트": [
+            "AI agent",
+            "agentic AI",
+            "AI 에이전트",
+            "multi-agent",
+            "MCP protocol",
+            "LangGraph",
+            "AutoGen",
+            "computer use AI",
+        ],
+
+        # AI 서비스/제품 (B2B/B2C 활용)
+        "AI_서비스": [
+            "AI assistant",
+            "AI copilot",
+            "generative AI",
+            "생성형 AI",
+            "AI 챗봇",
+            "enterprise AI",
+        ],
+
+        # 인프라/배포
+        "AI_인프라": [
+            "vLLM",
+            "Ollama",
+            "TensorRT-LLM",
+            "RAG",
+            "vector database",
+            "AI inference",
+            "GPU cluster",
+            "on-premise AI",
+        ],
+
+        # 규제/정책/윤리
+        "AI_규제정책": [
+            "EU AI Act",
+            "AI 규제",
+            "AI governance",
+            "AI safety",
+            "AI 윤리",
+            "AI copyright",
+        ],
+    },
+
+    "데이터엔지니어링": {
+
+        # 오케스트레이션/파이프라인 도구
+        "파이프라인_도구": [
+            "Apache Airflow",
+            "dbt",
+            "Apache Kafka",
+            "Apache Flink",
+            "Prefect",
+            "Dagster",
+            "데이터 파이프라인",
+        ],
+
+        # 처리 엔진
+        "처리_엔진": [
+            "Apache Spark",
+            "Databricks",
+            "DuckDB",
+            "Apache Iceberg",
+            "Delta Lake",
+            "데이터 레이크하우스",
+        ],
+
+        # 데이터 웨어하우스
+        "데이터_웨어하우스": [
+            "Snowflake",
+            "BigQuery",
+            "Amazon Redshift",
+            "ClickHouse",
+            "데이터 웨어하우스",
+        ],
+
+        # 데이터 품질/관측
+        "데이터_품질": [
+            "data quality",
+            "data observability",
+            "data lineage",
+            "데이터 품질",
+            "데이터 거버넌스",
+            "data governance",
+        ],
+
+        # AI와 데이터엔지니어링 교차점
+        "AI_데이터": [
+            "data engineering AI",
+            "AI pipeline",
+            "feature store",
+            "MLOps",
+            "LLMOps",
+            "데이터 엔지니어링",
+        ],
+    },
+
+    "RPA": {
+
+        # RPA 플랫폼
+        "RPA_플랫폼": [
+            "UiPath",
+            "Automation Anywhere",
+            "Power Automate",
+            "Blue Prism",
+            "삼성SDS RPA",
+            "RPA 플랫폼",
+        ],
+
+        # 지능형 자동화 (RPA + AI 결합 트렌드)
+        "지능형_자동화": [
+            "intelligent automation",
+            "hyperautomation",
+            "AI RPA",
+            "agentic automation",
+            "IDP",                      # Intelligent Document Processing
+            "지능형 자동화",
+            "업무 자동화 AI",
+        ],
+
+        # 프로세스 마이닝
+        "프로세스_마이닝": [
+            "process mining",
+            "Celonis",
+            "task mining",
+            "프로세스 마이닝",
+            "process intelligence",
+        ],
+
+        # RPA 트렌드/시장
+        "RPA_시장동향": [
+            "RPA market",
+            "RPA 트렌드",
+            "디지털 전환 자동화",
+            "업무 자동화 시장",
+            "robotic process automation",
+        ],
+    },
 }
 
+# ── 설정 ──────────────────────────────────────────────────────
+BATCH_SIZE = 50
+LANGUAGES = [
+    {"hl": "ko", "gl": "KR", "ceid": "KR:ko", "country_cd": "kor"},
+    {"hl": "en-US", "gl": "US", "ceid": "US:en", "country_cd": "usa"},
+]
 
-def generate_rss_url(keyword):
-    """Generate Google News RSS URL for a given keyword"""
-    base = "https://news.google.com/rss/search?q="
-    query = keyword.replace(" ", "+")
-    return f"{base}{query}&hl=ko&gl=KR&ceid=KR:ko"
+CRAWL_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8",
+}
+BODY_MAX_CHARS = 2000
+CRAWL_TIMEOUT  = 8
 
 
-def fetch_and_store_news():
-    """Fetch news for each keyword and store them in Supabase in batches.
-    Logs the process and any errors encountered.
+# ── 본문 크롤러 ───────────────────────────────────────────────
+def crawl_body(url: str) -> tuple[str | None, str]:
     """
-    logger.info("Starting news fetch process...")
-    total_processed = 0
-    batch_size = 50  # 배치 크기 설정
-    batch = []  # 배치 데이터를 저장할 리스트
+    URL 본문 크롤링
+    반환: (본문텍스트 or None, status)
+    status: success / failed / paywalled / timeout
+    """
+    # Google News 리다이렉트 URL 처리
+    if "news.google.com" in url:
+        try:
+            resp = requests.get(
+                url, headers=CRAWL_HEADERS,
+                timeout=CRAWL_TIMEOUT, allow_redirects=True
+            )
+            url = resp.url  # 실제 기사 URL로 교체
+        except Exception:
+            return None, "failed"
 
-    for category, keywords in CATEGORIES.items():
-        for keyword in keywords:
-            logger.info(f"Processing keyword: {keyword}")
-            
-            # 한국어 뉴스 검색
-            kr_url = f"https://news.google.com/rss/search?q={keyword.replace(' ', '+')}&hl=ko&gl=KR&ceid=KR:ko"
-            # 영어 뉴스 검색
-            us_url = f"https://news.google.com/rss/search?q={keyword.replace(' ', '+')}&hl=en-US&gl=US&ceid=US:en"
-            
-            all_entries = []
-            
-            # 한국어 뉴스 가져오기
-            try:
-                kr_feed = feedparser.parse(kr_url)
-                if hasattr(kr_feed, 'entries'):
-                    # 한국어 뉴스에 source_country_cd 추가
-                    for entry in kr_feed.entries:
-                        entry.source_country = 'kor'
-                    all_entries.extend(kr_feed.entries)
-                    logger.info(f"Found {len(kr_feed.entries)} Korean entries for keyword: {keyword}")
-            except Exception as e:
-                logger.warning(f"Error fetching Korean news for {keyword}: {str(e)}")
-            
-            # 영어 뉴스 가져오기
-            try:
-                us_feed = feedparser.parse(us_url)
-                if hasattr(us_feed, 'entries'):
-                    # 영어 뉴스에 source_country_cd 추가
-                    for entry in us_feed.entries:
-                        entry.source_country = 'usa'
-                    all_entries.extend(us_feed.entries)
-                    logger.info(f"Found {len(us_feed.entries)} English entries for keyword: {keyword}")
-            except Exception as e:
-                logger.warning(f"Error fetching US news for {keyword}: {str(e)}")
-            
-            if not all_entries:
-                logger.info(f"No entries found for keyword: {keyword}")
-                continue
-                
-            logger.info(f"Total {len(all_entries)} entries found for keyword: {keyword}")
-            keyword_processed = 0
-            
-            for entry in all_entries:
-                try:
-                    # Extract title and clean it
-                    title = entry.get('title', '').strip()
-                    if not title:
-                        logger.debug("Skipping entry with empty title")
+    try:
+        resp = requests.get(
+            url, headers=CRAWL_HEADERS,
+            timeout=CRAWL_TIMEOUT, allow_redirects=True
+        )
+
+        # 페이월 감지 (구독 유도 패턴)
+        paywall_signals = [
+            "subscribe", "subscription", "sign in to read",
+            "구독", "로그인 후", "회원 전용"
+        ]
+        if any(s in resp.text.lower() for s in paywall_signals):
+            # 페이월이어도 일부 본문이 있을 수 있으니 일단 파싱 시도
+            pass
+
+        soup = BeautifulSoup(resp.text, 'html.parser')
+
+        # 불필요 태그 제거
+        for tag in soup(['script', 'style', 'nav', 'footer',
+                         'header', 'aside', 'form', 'iframe']):
+            tag.decompose()
+
+        # RSS description을 fallback으로 먼저 확보
+        body = None
+
+        # 본문 후보 선택자 (우선순위 순)
+        selectors = [
+            'article',
+            '[class*="article-body"]',
+            '[class*="post-content"]',
+            '[class*="entry-content"]',
+            '[class*="news-body"]',
+            'main',
+            '.content',
+            'body',
+        ]
+
+        for selector in selectors:
+            el = soup.select_one(selector)
+            if el:
+                text = el.get_text(separator=' ', strip=True)
+                text = re.sub(r'\s+', ' ', text).strip()
+                if len(text) > 200:
+                    body = text[:BODY_MAX_CHARS]
+                    break
+
+        if body:
+            return body, "success"
+
+        return None, "failed"
+
+    except requests.Timeout:
+        return None, "timeout"
+    except Exception as e:
+        logger.debug(f"크롤링 오류 ({url[:60]}): {e}")
+        return None, "failed"
+
+
+# ── 유틸 함수 ─────────────────────────────────────────────────
+def build_rss_url(keyword: str, lang: dict) -> str:
+    q = keyword.replace(" ", "+")
+    return (
+        f"https://news.google.com/rss/search?q={q}"
+        f"&hl={lang['hl']}&gl={lang['gl']}&ceid={lang['ceid']}"
+    )
+
+def clean_html(text: str) -> str:
+    text = re.sub(r'<[^>]+>', '', text)
+    return re.sub(r'\s+', ' ', text).strip()
+
+def parse_pub_date(entry) -> datetime:
+    if hasattr(entry, 'published_parsed') and entry.published_parsed:
+        return datetime(*entry.published_parsed[:6])
+    return datetime.now()
+
+def get_source(entry) -> str:
+    if hasattr(entry, 'source') and hasattr(entry.source, 'title'):
+        return entry.source.title
+    return getattr(entry, 'author', 'Unknown')
+
+def flush_batch(batch: list) -> None:
+    if not batch:
+        return
+    try:
+        supabase.table('ai_news').upsert(batch, on_conflict='url').execute()
+        logger.info(f"  └ upsert {len(batch)}건 완료")
+    except Exception as e:
+        logger.error(f"  └ 배치 insert 오류: {e}")
+    batch.clear()
+
+
+# ── 핵심 수집 함수 ────────────────────────────────────────────
+def build_record(
+    entry,
+    country_cd: str,
+    keyword: str,
+    category: str,
+    subcategory: str,
+) -> dict | None:
+    title = entry.get('title', '').strip()
+    if not title:
+        return None
+
+    return {
+        'title':             title[:500],
+        'source':            get_source(entry)[:200],
+        'url':               entry.get('link', ''),
+        'keyword':           keyword,
+        'pub_date':          parse_pub_date(entry).isoformat(),
+        'category':          category,
+        'subcategory':       subcategory,
+        'source_country_cd': country_cd,
+        # body 관련 필드 전부 제거
+    }
+
+
+# ── 메인 실행 ─────────────────────────────────────────────────
+def fetch_and_store_news() -> int:
+    logger.info("=== 뉴스 수집 시작 ===")
+    total = 0
+    batch: list[dict] = []
+
+    for category, subcats in CATEGORIES.items():
+        logger.info(f"[대분류] {category}")
+
+        for subcategory, keywords in subcats.items():
+            logger.info(f"  [소분류] {subcategory}")
+
+            for keyword in keywords:
+                for lang in LANGUAGES:
+                    url = build_rss_url(keyword, lang)
+                    try:
+                        feed    = feedparser.parse(url)
+                        entries = getattr(feed, 'entries', [])
+                        logger.info(
+                            f"    [{lang['country_cd']}] "
+                            f"'{keyword}' → {len(entries)}건"
+                        )
+                    except Exception as e:
+                        logger.warning(f"RSS 수집 실패 ({keyword}): {e}")
                         continue
 
-                    # Extract and clean description
-                    description = entry.get('description', '')
-                    description = re.sub(r'<[^>]+>', '', description)  # Remove HTML tags
-                    description = re.sub(r'\s+', ' ', description).strip()
+                    for entry in entries:
+                        record = build_record(
+                            entry, lang['country_cd'],
+                            keyword, category, subcategory
+                        )
+                        if record:
+                            batch.append(record)
+                            total += 1
 
-                    # Extract source from the entry
-                    source = 'Unknown'
-                    if hasattr(entry, 'source') and hasattr(entry.source, 'title'):
-                        source = entry.source.title
-                    elif hasattr(entry, 'author'):
-                        source = entry.author
+                        if len(batch) >= BATCH_SIZE:
+                            flush_batch(batch)
 
-                    # Parse publication date
-                    pub_date = datetime.now()  # Default to current time
-                    if hasattr(entry, 'published_parsed') and entry.published_parsed:
-                        pub_date = datetime(*entry.published_parsed[:6])
-
-                    # Prepare data for Supabase
-                    data = {
-                        'title': title[:500],  # Limit title length
-                        'description': description[:2000],  # Limit description length
-                        'source': source[:200],  # Limit source length
-                        'url': entry.link,
-                        'keyword': keyword,
-                        'pub_date': pub_date.isoformat(),
-                        'category': category,
-                        'subcategory': keyword,
-                        'source_country_cd': getattr(entry, 'source_country', 'unknown')  # 국가 코드 추가
-                    }
-
-                    # 배치에 데이터 추가
-                    batch.append(data)
-                    keyword_processed += 1
-
-                    # 배치 크기에 도달하면 일괄 삽입
-                    if len(batch) >= batch_size:
-                        try:
-                            result = supabase.table('ai_news').upsert(batch, on_conflict='url').execute()
-                            if hasattr(result, 'data') and result.data:
-                                logger.info(f"Inserted/Updated {len(batch)} records in batch")
-                            else:
-                                logger.warning("No data returned for batch insert")
-                            batch = []  # 배치 초기화
-                        except Exception as e:
-                            logger.error(f"Batch insert error: {str(e)}")
-                            batch = []  # 에러 발생 시 배치 초기화
-
-                except Exception as e:
-                    logger.error(f"Error processing entry: {str(e)}", exc_info=True)
-                    continue
-
-            # 남은 배치 데이터 처리
-            if batch:
-                try:
-                    result = supabase.table('ai_news').upsert(batch, on_conflict='url').execute()
-                    if hasattr(result, 'data') and result.data:
-                        logger.info(f"Inserted/Updated final batch of {len(batch)} records")
-                    else:
-                        logger.warning("No data returned for final batch insert")
-                except Exception as e:
-                    logger.error(f"Final batch insert error: {str(e)}")
-                batch = []  # 마지막 배치 초기화
-
-            total_processed += keyword_processed
-            logger.info(f"Processed {keyword_processed} entries for keyword: {keyword}")
-
-    # 마지막으로 남은 배치가 있는지 확인
-    if batch:
-        try:
-            result = supabase.table('ai_news').upsert(batch, on_conflict='url').execute()
-            if hasattr(result, 'data') and result.data:
-                logger.info(f"Inserted/Updated final batch of {len(batch)} records")
-            else:
-                logger.warning("No data returned for final batch insert")
-        except Exception as e:
-            logger.error(f"Final batch insert error: {str(e)}")
-
-    logger.info(f"Total {total_processed} entries processed.")
-    logger.info(f"News fetch process completed. Total entries processed: {total_processed}")
-    return total_processed
+    flush_batch(batch)
+    logger.info(f"=== 수집 완료 | 총 {total}건 처리 ===")
+    return total
 
 
 if __name__ == "__main__":
