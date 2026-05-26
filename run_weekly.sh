@@ -38,7 +38,7 @@ else
     echo "      ❌ 논문 수집 실패 (로그: logs/arxiv_$DATE.log)"
 fi
 
-# ── 1. 뉴스 + 논문 처리 → DB 저장 ───────────
+# ── 3. 뉴스 + 논문 처리 → DB 저장 ───────────
 echo ""
 echo "[1/3] 뉴스+논문 처리 및 리포트 생성..."
 uv run "$PROJECT_DIR/news_data_processor.py" >> "$LOG_DIR/processor_$DATE.log" 2>&1
@@ -49,7 +49,7 @@ else
     exit 1
 fi
 
-# ── 2. 리포트 HTML 생성 ──────────────────────
+# ── 4. 리포트 HTML 생성 ──────────────────────
 echo ""
 echo "[2/3] 리포트 HTML 생성..."
 uv run "$PROJECT_DIR/generate_report_html.py" >> "$LOG_DIR/report_html_$DATE.log" 2>&1
@@ -61,7 +61,7 @@ else
     echo "      ❌ 리포트 HTML 생성 실패"
 fi
 
-# ── 3. 카드뉴스 HTML 생성 ────────────────────
+# ── 5. 카드뉴스 HTML 생성 ────────────────────
 echo ""
 echo "[3/3] 링크드인 카드뉴스 생성..."
 uv run "$PROJECT_DIR/generate_linkedin_card.py" >> "$LOG_DIR/card_$DATE.log" 2>&1

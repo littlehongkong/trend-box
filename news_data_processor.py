@@ -199,8 +199,34 @@ class WeeklyReportGenerator:
 (각 항목마다: 제목, 1~2줄 요약, 출처)
 
 ## 💡 실무 적용 포인트
-(개발자/기획자가 지금 바로 챙겨야 할 액션 아이템 2~3개)
-(각 포인트마다 왜 중요한지, 어떻게 적용할지 구체적으로)
+
+현재 [{big_category}] 분야 실무자가
+실제 업무에 적용 가능한 항목만 작성한다.
+
+작성 규칙:
+
+1. 뉴스 내용 재요약 금지
+2. 추상적인 조언 금지
+3. "중요하다", "고려해야 한다", "필요하다", "활용 가능하다" 사용 금지
+4. 즉시 업무 티켓(Jira/회의 안건) 생성 가능한 수준으로 작성
+5. 최대 3개까지만 작성
+6. 실제 시스템 / DB / API / 파이프라인 / 운영 관점 포함
+
+각 항목은 아래 형식 유지:
+
+### [한 줄 제목]
+
+[업무 영향]
+- 현재 [{big_category}] 업무에서 영향을 받는 영역
+
+[이번 주 액션]
+- 바로 실행 가능한 작업 1~3개
+
+[구현 예시]
+- DB 테이블 / API / 파이프라인 / 코드 예시 중 하나
+
+[주의사항]
+- 운영 시 발생 가능한 문제 또는 제한사항
 ---
 
 규칙:
@@ -220,7 +246,7 @@ class WeeklyNewsProcessor:
 
     # 카테고리별 컨텍스트 (LLM 필터링용)
     CATEGORY_CONTEXT = {
-        "AI": "LLM, 에이전트, 생성형AI, AI모델, AI서비스, AI정책, AI인프라, 오케스트레이션, MCP, RAG",
+        "AI": "LLM, 에이전트, 생성형AI, AI모델, AI서비스, AI정책, AI인프라, 오케스트레이션, MCP, RAG, 제외: AI 거버넌스 정치 이슈, 노동/임금 분쟁,거시 경제 정책, AI 윤리 선언",
         "데이터엔지니어링": "데이터파이프라인, RAG, 벡터DB, 데이터거버넌스, 지식그래프, 데이터품질, ETL, GraphRAG",
         "RPA": "업무자동화, 프로세스자동화, 문서AI, OCR, 워크플로, RPA, IDP, 에이전틱자동화",
     }
@@ -345,9 +371,10 @@ class WeeklyNewsProcessor:
 이 분야의 핵심 관심사: [{context}]
 
 판단 기준:
-포함 ✅: 기술 동향, 신규 서비스/모델, 정책/규제, 투자/인수, 실무 적용 사례
+포함 ✅: 기술 동향, 신규 서비스/모델, 정책/규제, 투자/인수, 실무 적용 사례, 실무에 직접 영향을 주는 규제(예: 망분리 완화, 데이터 거버넌스 의무화)
 제외 ❌: 지역 행사/관광/캐릭터, 연예/스포츠, 단순 수상/인사, 
-         부동산/금융상품, 건강식품, 광고성 보도자료, IT와 무관한 산업
+        부동산/금융상품, 건강식품, 광고성 보도자료, IT와 무관한 산업
+        AI를 단순 언급만 하는 정치/경제 정책 기사(예: AI 이익 분배, AI 일자리 정책, AI 규제 국회 발의 등 → 실무자가 코드/설계에 바로 활용 불가한 거시 정책)
 
 {titles_text}
 
@@ -629,9 +656,10 @@ JSON: {{"new_services":[1,3],"updates":[2],"investment":[],"infrastructure":[4],
             sections_data[section] = [
                 {
                     'title':  news.get('title', ''),
-                    'body':   news.get('body_text', '')[:500] if news.get('body_text') else '',
+                    'body':   news.get('body_text', '')[:2000] if news.get('body_text') else '',
                     'url':    news.get('real_url') or news.get('url', ''),
                     'source': news.get('source', ''),
+                    'pub_date': news.get('pub_date', ''),  # ← 추가
                 }
                 for news in items[:5]
             ]
@@ -641,10 +669,11 @@ JSON: {{"new_services":[1,3],"updates":[2],"investment":[],"infrastructure":[4],
             sections_data['domestic'] = [
                 {
                     'title':    n.get('title', ''),
-                    'body':     n.get('body_text', '')[:500] if n.get('body_text') else '',
+                    'body':     n.get('body_text', '')[:2000] if n.get('body_text') else '',
                     'url':      n.get('url', ''),
                     'source':   n.get('source', ''),
                     'priority': n.get('priority', 5),
+                    'pub_date': n.get('pub_date', ''),  # ← 추가
                 }
                 for n in domestic_news[:8]
             ]
@@ -655,9 +684,10 @@ JSON: {{"new_services":[1,3],"updates":[2],"investment":[],"infrastructure":[4],
                 {
                     'title':      n.get('title', ''),
                     'summary_ko': n.get('summary_ko', ''),
-                    'body':       n.get('body_text', '')[:300] if n.get('body_text') else '',
+                    'body':       n.get('body_text', '')[:2000] if n.get('body_text') else '',
                     'url':        n.get('url', ''),
                     'source':     n.get('source', ''),
+                    'pub_date':   n.get('pub_date', ''),  # ← 추가
                 }
                 for n in global_news[:5]
             ]

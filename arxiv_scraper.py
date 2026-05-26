@@ -86,20 +86,15 @@ SEARCH_CONFIG = {
                 "cat:cs.AI OR cat:cs.CV OR cat:cs.CL"
             ),
             "keywords": [
-                # 문서 처리
+                "robotic process automation", "RPA",
+                "workflow automation", "process mining",
+                "business process", "task automation",
                 "document understanding", "document AI",
                 "intelligent document processing", "IDP",
                 "OCR", "optical character recognition",
-                "document layout", "form understanding",
-                "information extraction",
-                # 프로세스 자동화
-                "robotic process automation", "RPA",
-                "process mining", "workflow automation",
-                "business process", "task automation",
-                # 에이전트 실행
-                "computer use", "GUI agent",
-                "web agent", "browser automation",
-                "tool use", "function calling",
+                "form understanding", "information extraction",
+                "GUI agent", "computer use", "web agent",
+                "browser automation", "desktop automation",
             ],
             "max_results": 50,
         },

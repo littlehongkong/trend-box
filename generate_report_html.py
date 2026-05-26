@@ -42,6 +42,19 @@ def safe_filename(text: str, max_len: int = 40) -> str:
     return text[:max_len]
 
 
+def format_url_display(url: str) -> str:
+    """URL 표시용 단축 처리"""
+    if not url:
+        return ''
+    if 'news.google.com/rss/articles' in url:
+        return 'Google News'
+    if 'news.google.com' in url:
+        return 'Google News'
+    # 일반 URL: 도메인만 추출
+    m = re.match(r'https?://(?:www\.)?([^/]+)', url)
+    return m.group(1) if m else url[:40]
+
+
 def fetch_reports(supabase: Client, week_label: str) -> dict:
     resp = supabase.table('weekly_reports') \
         .select('*') \
@@ -73,64 +86,160 @@ def parse_summary_only(report_text: str) -> list:
 
 def parse_actions_only(report_text: str) -> list:
     actions, in_action = [], False
+    current_action = ''
+
     for line in report_text.split('\n'):
         line = line.strip()
-        if '실무 적용' in line:
+
+        # 실무 적용 섹션 시작
+        if '실무 적용' in line and line.startswith('#'):
             in_action = True; continue
-        if in_action and line.startswith('##'): break
-        if in_action and line and (
-            line[0].isdigit() or line.startswith('-') or line.startswith('•')
-        ):
-            text = re.sub(r'^[\d\-•.]\s*', '', line)
+
+        # 다음 ## 섹션 시작 시 종료 (### 는 포인트 제목일 수 있으므로 ## 만)
+        if in_action and re.match(r'^##[^#]', line) and '실무' not in line:
+            break
+
+        if not in_action:
+            continue
+
+        # ### 1) 또는 ### 포인트 제목 패턴
+        if re.match(r'^###', line):
+            if current_action and len(current_action) > 10:
+                actions.append(current_action)
+            # ### 제목에서 텍스트 추출
+            text = re.sub(r'^#+\s*', '', line)
+            text = re.sub(r'^\d+[)\.\s]+', '', text)
+            text = re.sub(r'\*\*(.*?)\*\*', r'\1', text).strip()
+            text = re.sub(r'\s*https?://\S+', '', text).strip()
+            current_action = text
+            continue
+
+        # 숫자 목록 패턴: 1. / 1) 으로 시작
+        num_m = re.match(r'^(\d+)[)\.]\s+(.*)', line)
+        if num_m:
+            if current_action and len(current_action) > 10:
+                actions.append(current_action)
+            text = num_m.group(2)
             text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
-            text = re.sub(r'\s*[\(\[]?관련:?\s*https?://\S+[\)\]]?', '', text)
+            text = re.sub(r'\s*https?://\S+', '', text).strip()
+            current_action = text
+            continue
+
+        # - 로 시작하는 최상위 포인트 (들여쓰기 없는 것만)
+        if line.startswith('- ') and not line.startswith('  '):
+            if current_action and len(current_action) > 10:
+                actions.append(current_action)
+            text = re.sub(r'^-\s*', '', line)
+            text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
             text = re.sub(r'\s*\(?출처:.*', '', text)
-            text = re.sub(r'\s*https?://\S+', '', text)
-            text = text.strip().lstrip('.').strip()
+            text = re.sub(r'\s*https?://\S+', '', text).strip()
             text = re.sub(r'\([^)]*$', '', text).strip()
-            if text and len(text) > 10:
-                actions.append(text)
-    return actions[:3]
+            current_action = text
+            continue
+
+    # 마지막 항목 저장
+    if current_action and len(current_action) > 10:
+        actions.append(current_action)
+
+    # URL/출처 최종 정리
+    cleaned = []
+    for a in actions[:3]:
+        a = re.sub(r'\s*[\(\[]?관련:?\s*https?://\S+[\)\]]?', '', a)
+        a = re.sub(r'\s*\(?출처:.*', '', a)
+        a = re.sub(r'\s*https?://\S+', '', a)
+        a = a.strip().lstrip('.').strip()
+        a = re.sub(r'\([^)]*$', '', a).strip()
+        if a and len(a) > 10:
+            cleaned.append(a)
+
+    return cleaned[:3]
 
 
 def parse_research_from_report(report_text: str) -> list:
-    """리포트 텍스트에서 논문 섹션 파싱"""
+    """
+    리포트 텍스트에서 논문 섹션 파싱
+    형식:
+    - **[논문 제목]**
+      - 핵심 기여: ...
+      - 실무 관련성: ...
+      - 링크: https://arxiv.org/...
+    """
     items       = []
     in_research = False
     current     = None
 
     for line in report_text.split('\n'):
+        raw  = line
         line = line.strip()
 
-        if '연구 동향' in line or 'Research Trend' in line or '📚' in line:
+        # 연구 동향 섹션 시작 감지
+        if re.search(r'(연구\s*동향|Research\s*Trend|📚)', line) and line.startswith('#'):
             in_research = True; continue
 
-        if in_research and line.startswith('##') and '연구' not in line:
+        # 다음 ## 섹션 시작 시 종료 (연구 관련 아닌 것만)
+        if in_research and re.match(r'^##[^#]', line) and '연구' not in line:
             break
 
-        if in_research:
-            # 논문 제목 패턴: - **[제목]** 또는 - **제목**
-            m = re.search(r'\*\*(.*?)\*\*', line)
-            if m and (line.startswith('-') or line.startswith('*')):
-                title = m.group(1).strip('[]')
-                rest  = line[m.end():].lstrip(' —-').strip()
+        if not in_research:
+            continue
 
-                url_m = re.search(r'https?://\S+', rest)
-                url   = url_m.group(0).rstrip(')') if url_m else ''
-                body  = re.sub(r'https?://\S+', '', rest).strip().rstrip('()')
+        # 논문 제목 감지: - **[제목]** 또는 - **제목**
+        # [제목] 형태 우선, 그 다음 일반 **제목**
+        title_m = re.match(r'^-\s+\*+\[([^\]]+)\]\*+', line)
+        if not title_m:
+            title_m2 = re.match(r'^-\s+\*+([^*\[]+)\*+', line)
+            if title_m2:
+                candidate = title_m2.group(1).strip()
+                # 핵심기여/실무 같은 메타 항목은 제목으로 취급 안 함
+                if not re.match(r'^(핵심|실무|링크|출처|URL)', candidate):
+                    title_m = title_m2
 
-                current = {'title': title, 'body': body[:300], 'url': url, 'detail': ''}
+        if title_m:
+            # 이전 논문 저장
+            if current and current.get('title'):
                 items.append(current)
+            current = {
+                'title':  title_m.group(1).strip(),
+                'body':   '',
+                'detail': '',
+                'url':    '',
+            }
+            continue
 
-            elif current and line.startswith('-') and current:
-                # 핵심기여, 실무관련성 등 세부 항목
-                detail = re.sub(r'\*\*(.*?)\*\*', r'\1', line)
-                detail = re.sub(r'^[-•]\s*', '', detail).strip()
-                url_m  = re.search(r'https?://\S+', detail)
-                if url_m and not current['url']:
+        if current is None:
+            continue
+
+        # 들여쓰기된 세부 항목 파싱
+        if raw.startswith('  ') or raw.startswith('\t'):
+            # 링크
+            if re.match(r'[-\s]*링크[:：]', line) or re.match(r'[-\s]*URL[:：]', line):
+                url_m = re.search(r'https?://\S+', line)
+                if url_m:
                     current['url'] = url_m.group(0).rstrip(')')
-                elif detail and not detail.startswith('http'):
-                    current['detail'] += detail + ' '
+                continue
+
+            # 핵심 기여
+            if re.match(r'[-\s]*(핵심\s*기여|핵심\s*내용)[:：]', line):
+                text = re.sub(r'^[-\s]*(핵심\s*기여|핵심\s*내용)[:：]\s*', '', line)
+                text = re.sub(r'\*\*(.*?)\*\*', r'\1', text).strip()
+                current['body'] = text[:250]
+                continue
+
+            # 실무 관련성
+            if re.match(r'[-\s]*(실무\s*관련성|실무)[:：]', line):
+                text = re.sub(r'^[-\s]*(실무\s*관련성|실무)[:：]\s*', '', line)
+                text = re.sub(r'\*\*(.*?)\*\*', r'\1', text).strip()
+                current['detail'] = text[:200]
+                continue
+
+            # URL이 단독으로 있는 줄
+            url_m = re.search(r'https?://\S+', line)
+            if url_m and not current['url']:
+                current['url'] = url_m.group(0).rstrip(')')
+
+    # 마지막 논문 저장
+    if current and current.get('title'):
+        items.append(current)
 
     return items[:5]
 
@@ -262,8 +371,9 @@ def build_news_item_html(
         f'<a class="detail-link" href="{local_path}">자세히 보기 →</a>'
         if local_path else ''
     )
+    url_display = format_url_display(url)
     url_text = (
-        f'<span class="news-url">{url}</span>'
+        f'<span class="news-url" title="{url}">{url_display}</span>'
         if url else ''
     )
 
@@ -294,6 +404,11 @@ def build_paper_item_html(item: dict, local_path: str = '') -> str:
         f'<a class="detail-link arxiv-link" href="{local_path}">초록 전문 →</a>'
         if local_path else ''
     )
+    url_display = format_url_display(url)
+    url_text    = (
+        f'<span class="news-url" title="{url}">{url_display}</span>'
+        if url else ''
+    )
 
     return f'''
     <div class="news-item paper-item">
@@ -304,7 +419,7 @@ def build_paper_item_html(item: dict, local_path: str = '') -> str:
       {f'<div class="news-summary">{summary}</div>' if summary else ''}
       {f'<div class="paper-insight">💡 {detail}</div>' if detail else ''}
       <div class="news-footer">
-        {f'<span class="news-url">{url}</span>' if url else ''}
+        {url_text}
         {detail_btn}
       </div>
     </div>'''
@@ -324,11 +439,27 @@ def build_tab_html(
     summary_html = '\n'.join([f'<li>{s}</li>' for s in summary]) \
                    if summary else '<li>요약 정보가 없습니다.</li>'
 
+    # ── 중복 방지용 URL/제목 집합 ─────────────────────────────
+    seen_urls   = set()
+    seen_titles = set()
+
+    def is_duplicate(item: dict) -> bool:
+        url   = item.get('url', '').strip()
+        title = re.sub(r'[^\w가-힣]', '', item.get('title', '')).lower()[:25]
+        if url and url in seen_urls:
+            return True
+        if title and title in seen_titles:
+            return True
+        if url:   seen_urls.add(url)
+        if title: seen_titles.add(title)
+        return False
+
     # ── 국내 주요 뉴스 ────────────────────────────────────────
     domestic_items = sections_json.get('domestic', [])
     domestic_html  = ''
     for i, item in enumerate(domestic_items):
-        local_path = save_article_file(item, i+1, f'{category}_domestic', output_dir)
+        if is_duplicate(item): continue
+        local_path     = save_article_file(item, i+1, f'{category}_domestic', output_dir)
         domestic_html += build_news_item_html(item, local_path, 'domestic')
     if not domestic_html:
         domestic_html = '<div class="empty-msg">수집된 국내 뉴스가 없습니다.</div>'
@@ -337,23 +468,28 @@ def build_tab_html(
     global_items = sections_json.get('global', [])
     global_html  = ''
     for i, item in enumerate(global_items):
-        local_path = save_article_file(item, i+1, f'{category}_global', output_dir)
-        global_html += build_news_item_html(item, local_path, 'global')
+        if is_duplicate(item): continue
+        local_path    = save_article_file(item, i+1, f'{category}_global', output_dir)
+        global_html  += build_news_item_html(item, local_path, 'global')
     if not global_html:
         global_html = '<div class="empty-msg">수집된 글로벌 뉴스가 없습니다.</div>'
 
-    # ── 추가 뉴스 (Google News 섹션) ─────────────────────────
+    # ── 추가 뉴스 (Google News 섹션) - 앞 섹션과 중복 제거 ───
     google_html  = ''
     google_count = 0
     for section_key in ['new_services', 'updates', 'investment', 'infrastructure', 'trends']:
         items = sections_json.get(section_key, [])
         if not items: continue
-        label = SECTION_LABELS.get(section_key, section_key)
-        google_html += f'<div class="subsection-label">{label}</div>'
+        label        = SECTION_LABELS.get(section_key, section_key)
+        section_html = ''
         for i, item in enumerate(items[:3]):
-            local_path   = save_article_file(item, i+1, f'{category}_{section_key}', output_dir)
-            google_html += build_news_item_html(item, local_path, 'google')
+            if is_duplicate(item): continue   # ← 중복 건너뜀
+            local_path    = save_article_file(item, i+1, f'{category}_{section_key}', output_dir)
+            section_html += build_news_item_html(item, local_path, 'google')
             google_count += 1
+        if section_html:
+            google_html += f'<div class="subsection-label">{label}</div>'
+            google_html += section_html
 
     if not google_html:
         google_html = '<div class="empty-msg">추가 뉴스가 없습니다.</div>'
